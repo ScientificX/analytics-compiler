@@ -1,0 +1,20 @@
+<component name="libraryTable">
+  <library name="Gradle: scala-sdk-2.13.12" type="Scala">
+    <properties>
+      <compiler-classpath>
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-lang/scala-compiler/2.13.12/ba2bfd2991537e8a5163c502f7c326a23acf74a4/scala-compiler-2.13.12.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-sbt/compiler-bridge_2.13/1.10.4/86789a1cc1e79778da31278cf6fc15997da9bba2/compiler-bridge_2.13-1.10.4-sources.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-sbt/compiler-interface/1.10.4/d59a0a539e0550c18d7c693b9a476486b18d6fe0/compiler-interface-1.10.4.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-lang/scala-reflect/2.13.12/88be4dbc90fdd2d12c05b6a872a9add60524461d/scala-reflect-2.13.12.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-lang/scala-library/2.13.12/3c51da898af4ebfac356fcde11388afb2ae8ee82/scala-library-2.13.12.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/io.github.java-diff-utils/java-diff-utils/4.12/1a712a91324d566eef39817fc5c9980eb10c21db/java-diff-utils-4.12.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.jline/jline/3.22.0/512dde71f1ba9cb87f318e4e1e3acc77dc67a712/jline-3.22.0.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/net.java.dev.jna/jna/5.13.0/1200e7ebeedbe0d10062093f32925a912020e747/jna-5.13.0.jar" />
+        <root url="file://$USER_HOME$/.gradle/caches/modules-2/files-2.1/org.scala-sbt/util-interface/1.10.4/3e200045df2988b178d7e7bc33bef7020528d85f/util-interface-1.10.4.jar" />
+      </compiler-classpath>
+    </properties>
+    <CLASSES />
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

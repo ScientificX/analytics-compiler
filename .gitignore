@@ -3,10 +3,11 @@
 
 # Ignore Gradle build output directory
 build/
+out/
 
 # Ignore all Java/Scala class files anywhere in the repo
 *.class
-**/*.class
+
 
 # Optional: common macOS and IDE files
 .DS_Store

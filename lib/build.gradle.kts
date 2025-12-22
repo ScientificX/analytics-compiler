@@ -31,6 +31,12 @@ dependencies {
     // FastParse for parsing
     implementation("com.lihaoyi:fastparse_2.13:2.3.3")
 
+    // Logback Classic for logging
+    // https://mvnrepository.com/artifact/ch.qos.logback/logback-classic
+    implementation("ch.qos.logback:logback-classic:1.5.22")
+// https://mvnrepository.com/artifact/com.typesafe.scala-logging/scala-logging
+    implementation("com.typesafe.scala-logging:scala-logging_2.13:3.9.5")
+
     // Use Scalatest for testing our library
     testImplementation(libs.junit)
     testImplementation(libs.scalatest.v2.v13)
@@ -42,8 +48,6 @@ dependencies {
     // This dependency is exported to consumers, that is to say found on their compile classpath.
     api(libs.commons.math3)
 }
-
-// Apply a specific Java toolchain to ease working on different environments.
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(21)

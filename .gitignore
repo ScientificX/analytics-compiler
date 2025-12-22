@@ -1,5 +1,13 @@
 # Ignore Gradle project-specific cache directory
-.gradle
+.gradle/
 
 # Ignore Gradle build output directory
-build
+build/
+
+# Ignore all Java/Scala class files anywhere in the repo
+*.class
+**/*.class
+
+# Optional: common macOS and IDE files
+.DS_Store
+.idea/

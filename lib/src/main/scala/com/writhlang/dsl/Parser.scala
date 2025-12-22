@@ -88,7 +88,7 @@ object Parser {
   }
 
   private def program[_: P]: P[(List[Shock], List[InstrumentRaw])] = P(
-    ws ~ shocksBlock ~ instrumentBlock.rep ~ ws ~ End
+    ws ~ shocksBlock ~ ws ~ instrumentBlock.rep ~ ws ~ End
   ).map { case (shocks, instruments) => (shocks, instruments.toList) }
 
   private def shocksBlock[_: P]: P[List[Shock]] = P(

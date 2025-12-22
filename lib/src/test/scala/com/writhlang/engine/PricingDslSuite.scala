@@ -3,15 +3,15 @@ package com.writhlang.engine
 import com.writhlang.dsl.Parser
 import org.scalatest.funsuite.AnyFunSuite
 import zio.{Runtime, Unsafe}
+import com.typesafe.scalalogging.LazyLogging
 
-class PricingDslSuite extends AnyFunSuite {
+class PricingDslSuite extends AnyFunSuite with LazyLogging {
   test("parse DSL with shocks and prepay curve") {
     val input =
       """
         |shocks {
         |  shock base { rate 0.0; spread 0.0; prepay 0.0; }
         |}
-        |
         |instrument mortgage M1 {
         |  notional 100000
         |  rate 0.04
@@ -21,7 +21,10 @@ class PricingDslSuite extends AnyFunSuite {
         |}
         |""".stripMargin
 
+    logger.info(s"Parsing input:\n$input")
+
     val parsed = Parser.parseProgram(input)
+    logger.info(s"Parsed program: $parsed")
     assert(parsed.isRight)
     val program = parsed.toOption.get
     assert(program.shocks.head.name == "base")

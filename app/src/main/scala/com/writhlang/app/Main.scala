@@ -14,18 +14,11 @@ object Main extends ZIOAppDefault {
   val defaultDsl: String =
     """
       |shocks {
-      |  shock s1 { rate 0.0005; spread 0.0001; prepay -0.005; }
-      |  shock s2 { rate -0.0005; spread -0.0001; prepay 0.005; }
-      |  shock s3 { rate 0.0010; spread 0.0002; }
-      |  shock s4 { rate -0.0010; spread -0.0002; }
-      |  shock s5 { rate 0.0020; spread 0.0004; prepay -0.01; }
-      |  shock s6 { rate -0.0020; spread -0.0004; prepay 0.01; }
-      |  shock s7 { rate 0.0025; }
-      |  shock s8 { rate -0.0025; }
-      |  shock s9 { rate 0.0030; }
-      |  shock s10 { rate -0.0030; }
-      |  shock s11 { rate 0.0040; spread 0.0008; }
-      |  shock s12 { rate -0.0040; spread -0.0008; }
+      |  shock up { rate 0.0005; spread 0.0001; prepay -0.005; }
+      |  shock down { rate -0.0005; spread -0.0001; prepay 0.005; }
+      |  shock twist { curve twist -0.001 0.001 10; }
+      |  shock bucket { curve bucket 5 0.001; }
+      |  shock vol { volatility 0.01; }
       |}
       |
       |instrument bond BondA {
@@ -44,6 +37,42 @@ object Main extends ZIOAppDefault {
       |  spread 0.0020
       |  prepayCurve ramp 0.02 0.06 24
       |}
+      |
+      |instrument swap SwapA {
+      |  notional 5000000
+      |  rate 0.03
+      |  spread 0.0005
+      |  fixedRate 0.031
+      |  maturity 5
+      |  freq 2
+      |}
+      |
+      |instrument cap CapA {
+      |  notional 2000000
+      |  rate 0.035
+      |  spread 0.0005
+      |  strike 0.04
+      |  maturity 3
+      |  freq 4
+      |  volatility 0.20
+      |}
+      |
+      |instrument mbs MbsA {
+      |  notional 500000
+      |  rate 0.04
+      |  spread 0.001
+      |  wac 0.05
+      |  wam 300
+      |  prepayCurve ramp 0.02 0.06 24
+      |}
+      |
+      |instrument fxforward FxA {
+      |  notional 1000000
+      |  domesticRate 0.02
+      |  fxRate 1.25
+      |  foreignRate 0.01
+      |  maturity 1
+      |}
       |""".stripMargin
 
   override def run: ZIO[Any with ZIOAppArgs with Scope, Any, Any] = {
@@ -53,7 +82,7 @@ object Main extends ZIOAppDefault {
       dsl <- loadDsl(config.inputPath)
       result <- Parser.parseProgram(dsl) match {
         case Left(err) =>
-          ZIO.succeed(println(s"Parse error: ${err}"))
+          ZIO.succeed(println(s"Parse error: $err"))
         case Right(program) =>
           val dag = DslCompiler.build(program)
           val dot = DotRenderer.toDot(dag)
@@ -96,14 +125,15 @@ object Main extends ZIOAppDefault {
       val basePrice = results.getOrElse(baseId, Double.NaN)
       println(s"${inst.id} base=${format(basePrice)}")
       program.shocks.foreach { shock =>
-        val scenarioId = DslCompiler.scenarioPriceId(inst.id, shock.name)
-        val price = results.getOrElse(scenarioId, Double.NaN)
-        println(s"  ${shock.name}: ${format(price)}")
+        val full = results.getOrElse(DslCompiler.fullScenarioId(inst.id, shock.name), Double.NaN)
+        val lin = results.getOrElse(DslCompiler.linearScenarioId(inst.id, shock.name), Double.NaN)
+        val quad = results.getOrElse(DslCompiler.quadraticScenarioId(inst.id, shock.name), Double.NaN)
+        println(s"  ${shock.name}: full=${format(full)} linear=${format(lin)} quadratic=${format(quad)}")
       }
     }
   }
 
-  private def format(value: Double): String = f"${value}%.4f"
+  private def format(value: Double): String = f"$value%.4f"
 
   private case class CliConfig(
     inputPath: Option[java.nio.file.Path],

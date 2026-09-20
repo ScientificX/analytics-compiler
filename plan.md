@@ -23,6 +23,7 @@ ORE does not ship turnkey).
 | Portfolio | none | desk → book → entity aggregation with netting + additivity |
 | XVA | none | CVA/DVA/FVA/ColVA/MVA/KVA |
 | Explain output | none | decomposition identity + unexplained residual |
+| Explain visualization | dependency-only DOT graph (no values, no contribution nodes) | P&L waterfall graph: per-level values + contribution nodes + residual (Stage 9) |
 | Validation | none | HPL vs RTPL, mean-ratio / correlation / variance-ratio tests (PLA) |
 | Performance | interpreted DAG over ZIO | cached sensitivity vector + dot-product fast path (primary); optional bytecode specialization |
 
@@ -56,6 +57,7 @@ ORE does not ship turnkey).
 | Prove the explain is accurate | HPL vs RTPL + statistical tests | Stage 7 |
 | Sensitivity-based P&L fast path (reuse δ across scenarios) | cached sensitivity vector + dot-product RTPL | Stage 8 (cross-cutting) |
 | Optional: make the one-time δ computation faster | compiled/specialized execution (deprioritized) | Stage 8 (secondary) |
+| Present the decomposition as a self-explaining graph | P&L waterfall visualization (values, contribution nodes, residual) | Stage 9 |
 
 ---
 
@@ -311,6 +313,56 @@ tractable at production scale (thousands of scenarios × large books × many ris
 
 ---
 
+## Stage 9 — Explain visualization: the P&L waterfall graph
+
+**Status: DEFERRED** — recorded now, implemented after Stage 6 (and ideally 7) matures.
+
+**Goal:** replace the current dependency-only DOT graph with a self-explaining **P&L
+waterfall**. Every computation level carries its value, per-factor contributions are explicit
+nodes, edges into the P&L totals carry their contribution amounts, and the graph reconciles to
+the decomposition identity `full PnL = Σ contributions + residual`.
+
+**Why not now:** the graph can only be *honestly* explanatory once the underlying numbers are
+meaningful. Today pricing is a flat curve with central-difference greeks, so any residual the
+graph would show is dominated by approximation error (third-order + finite-difference), not a
+real market move. The visualization is therefore gated on:
+
+- Stage 0–1 (granular keys + market-data objects) so contributions are addressed at the right
+  granularity;
+- Stage 2 (re-bootstrapped sensitivities) so `Σ δ·Δf` reconciles with revaluation;
+- Stage 3 (dated data) so theta/carry is separated, and Stage 4 (portfolio) so the roll-up nets;
+- Stage 6 (the decomposition identity) so there is a *residual to draw*.
+
+**What changes (design, recorded for later):**
+
+- **Engine (`DslCompiler`/`Executor`/`Instruction`):** materialize contributions as first-class
+  `Op` nodes — `LinearContribution` (`δᵢ·Δfᵢ`), `GammaContribution` (`½γᵢ·Δfᵢ²`),
+  `CrossContribution` (`crossᵢⱼ·ΔfᵢΔfⱼ`) — plus summary nodes `LinearPnl`, `QuadraticPnl`,
+  `FullPnl` (= full − base), and `Residual` (= full − quadratic). Terminal scenario prices then
+  sum these contribution nodes so the decomposition is traceable node-by-node.
+- **Renderer (`DotRenderer`):** accept the `Executor` value map; annotate every node with its
+  value and a finance-readable label (units + sign conventions); colour by role (shock / price /
+  greek / contribution / PnL / residual); label edges into PnL totals with the contribution
+  amount; align stages into left→right columns via `rank=same` (shocks → prices → greeks →
+  contributions → PnL totals → residual).
+- **CLI (`Main`):** print a per-instrument × per-shock waterfall report mirroring the graph, with
+  per-factor contributions and the residual.
+- **Tests:** identity `fullPnl == quadraticPnl + residual`; `Σ` contributions equals the scenario
+  PnL; DOT contains contribution labels/values when the value map is supplied; legacy
+  dependency-only rendering still works with an empty map.
+
+**PLA/explain capability unlocked:** the *same* engine output is rendered as both a
+reconciliation report and a visual explain a trader/regulator can read end-to-end.
+
+**ORE gap closed:** presentation of the decomposition (Stage 6 output); no new pricing model is
+introduced — this stage is the "report/visualize the explain" slice.
+
+**Acceptance criteria:** for the representative book, the graph shows per-level values and
+per-factor contributions, `full PnL = Σ contributions + residual` holds exactly (residual node
+visible and size-graded), and the contribution nodes reconcile with the Stage 6 textual report.
+
+---
+
 ## Sequencing & dependencies
 
 - **0 → 1 → 2** are the foundational chain and must be done in order (taxonomy → objects/scenarios
@@ -321,6 +373,7 @@ tractable at production scale (thousands of scenarios × large books × many ris
 - **6** depends on **0–5**.
 - **7** depends on **6**, and benefits from **8** for scale.
 - **8** (caching) needs **2** (sensitivities) and feeds **6/7**; the optional bytecode part can start once **1** stabilizes (compile the DAG) and deepen once **2** lands.
+- **9** (explain visualization) depends on **6** (the decomposition identity) and **0–5**; it benefits from **7** (knowing which desks/buckets to flag). Deliberately deferred until the explain is meaningful.
  
 
 ## Risks / open questions
@@ -338,6 +391,7 @@ tractable at production scale (thousands of scenarios × large books × many ris
 - **Turnkey vs platform:** even after Stage 7, the *regulatory* explain is a process (data feeds,
   trade system, sign-off); this plan produces the *engine*, not the operating procedure around it.
 - **Cache invalidation:** the δ/Γ cache is only valid for a fixed (asOf date, market state, position set); stale reuse across dates or trades silently corrupts RTPL. Enforce the key explicitly and add a test that changing the date or a trade invalidates the cache.
+- **Explain-visualization maturity:** the P&L waterfall graph (Stage 9) must not ship before the explain engine (Stage 6). Rendering the current flat-curve model would present approximation error as if it were an attributed market move. Gate it on the Stage 6 acceptance criteria.
 
 
 

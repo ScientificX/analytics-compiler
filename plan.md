@@ -61,6 +61,8 @@ ORE does not ship turnkey).
 
 ## Stage 0 — Risk-factor key taxonomy
 
+**Status: DONE** ✅ (implemented; `Factors.scala` removed, `com.writhlang.risk` added, `DslCompiler`/`DotRenderer` re-keyed, `PricingDslSuite` updated with taxonomy tests).
+
 **Goal:** replace the 5-factor enum with a proper, granular `RiskFactorKey` model.
 
 **What changes:**

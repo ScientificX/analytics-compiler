@@ -42,7 +42,8 @@ There are **two independent compiler systems** in the codebase, and it is import
 | `engine`     | `DslCompiler.scala`  | Translates `Program` into a `Dag` of computations. |
 |              | `Instruction.scala`, `Dag.scala` | Computation-node and graph model. |
 |              | `Executor.scala`     | ZIO-based topological execution. |
-|              | `Pricing.scala`, `Curve.scala`, `Factors.scala` | Pricing math, discount curve, risk factors. |
+|              | `Pricing.scala`, `Curve.scala` | Pricing math and discount curve. |
+| `risk`       | `KeyType.scala`, `RiskFactorKey.scala`, `LegacyRiskFactors.scala` | Risk-factor taxonomy, canonical keys, legacy DSL-word mapping. |
 | `render`     | `DotRenderer.scala`  | Graphviz DOT emission. |
 | `compiler`   | `Compiler.scala` + subpackages | Native x86-64 GAS backend (stub). |
 | `interpreter`| `Interpreter.scala`  | Thin wrapper around `Compiler`. |
@@ -159,5 +160,3 @@ A separate, early-stage path under `com.writhlang.compiler` compiles a tiny `let
 - **Parsing/validation** — `Parser.parseProgram` returns `Either[String, Program]` with validation messages.
 - **Execution** — `Executor.run` returns `IO[ExecutionError, Map[String, Double]]`; `ExecutionError` covers missing dependencies (`MissingDependency`) and graph-level failures (`GraphError`, e.g., a cycle).
 - **CLI** — `Main` maps parse and execution failures to human-readable `println` messages.
-
-

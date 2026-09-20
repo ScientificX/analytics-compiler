@@ -4,7 +4,19 @@ Guidance for humans and AI agents working in this repository.
 
 ## What this project is
 
-WrithLang is a Scala 2.13 **DSL compiler and execution engine for financial risk/pricing traceability**. It parses a small language of market shocks and financial instruments, builds a computation DAG, evaluates it in parallel with ZIO, and renders a Graphviz graph. See [README.md](README.md), [docs/architecture.md](docs/architecture.md), and [docs/dsl-reference.md](docs/dsl-reference.md).
+WrithLang is a Scala 2.13 **DSL compiler and execution engine for financial risk/pricing traceability**. It parses a small language of market shocks and financial instruments, builds a computation DAG, evaluates it in parallel with ZIO, and renders a Graphviz graph. See [README.md](README.md), [docs/architecture.md](docs/architecture.md), [docs/low-level-design.md](docs/low-level-design.md), and [docs/dsl-reference.md](docs/dsl-reference.md).
+
+## Documentation
+
+The docs under `docs/` are part of the codebase and must stay in sync with the code. Update them in the same change that modifies the behaviour they describe — not as a follow-up.
+
+| Doc | Update it when you… |
+| --- | ------------------- |
+| `docs/architecture.md` | Change module/package layout, the parse → DAG → execute → render pipeline, DAG construction, pricing models, error handling, or the native-compiler stub. |
+| `docs/low-level-design.md` | Change any component's public API, input/output shapes (AST case classes, `Op` variants, `Instruction`/`Dag`, node-id patterns, `RiskFactorKey`), or a pricing formula. |
+| `docs/dsl-reference.md` | Change the DSL grammar, instrument/field names, defaults, or validation rules. |
+
+When you add or change a public finance API, explain it in plain language for a software engineer with no finance background, and keep the finance glossary below consistent with any new terms you introduce.
 
 ## Build, test, run
 
@@ -32,7 +44,8 @@ Run from the repository root. On Windows use `gradlew.bat` instead of `./gradlew
 | Package | Responsibility |
 | ------- | -------------- |
 | `dsl` | DSL AST (`Ast.scala`) and FastParse parser (`Parser.scala`). |
-| `engine` | DAG builder (`DslCompiler`), instruction model (`Instruction`, `Dag`), executor (`Executor`), pricing (`Pricing`, `Curve`), risk factors (`Factors`). |
+| `engine` | DAG builder (`DslCompiler`), instruction model (`Instruction`, `Dag`), executor (`Executor`), pricing (`Pricing`, `Curve`). |
+| `risk`   | Risk-factor taxonomy and canonical keys (`KeyType`, `RiskFactorKey`, `LegacyRiskFactors`). |
 | `render` | `DotRenderer` — Graphviz DOT output. |
 | `compiler` | Early-stage native x86-64 GAS backend (`Compiler`, `frontend`, `ast`, `ir`, `backend.gas`). |
 | `interpreter` | Thin wrapper around `Compiler` (pure `Either` + ZIO `IO`). |

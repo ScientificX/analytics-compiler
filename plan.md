@@ -24,7 +24,7 @@ ORE does not ship turnkey).
 | XVA | none | CVA/DVA/FVA/ColVA/MVA/KVA |
 | Explain output | none | decomposition identity + unexplained residual |
 | Validation | none | HPL vs RTPL, mean-ratio / correlation / variance-ratio tests (PLA) |
-| Performance | interpreted DAG over ZIO | (optional) compiled/specialized JVM bytecode for large-book backtests |
+| Performance | interpreted DAG over ZIO | cached sensitivity vector + dot-product fast path (primary); optional bytecode specialization |
 
 ## Core principles (established from the analysis)
 
@@ -39,8 +39,8 @@ ORE does not ship turnkey).
    needed — the vector is the object); vol is a surface (expiry × strike).
 5. **A P&L explain is an identity that must reconcile.** Every stage below removes one source of
    error/residual so that the decomposed parts sum back to total P&L.
-6. **Compilation (JVM bytecode / specialization) is a performance enabler, not an explain feature.**
-   It slots in only where repeated large-book revaluation is the bottleneck (PLA backtesting).
+6. **Cache the sensitivity vector; don't recompute it per scenario.** Compute δ (and Γ) once per (asOf date, market state, position set), then evaluate each scenario move as a dot product δᵀ·Δf. This is the primary performance lever for PLA backtesting.
+7. **Compilation (JVM bytecode / specialization) is a secondary, optional optimization.** It speeds up the one-time δ computation; it does not replace caching.
 
 ## Requirement → capability → stage map
 
@@ -54,7 +54,8 @@ ORE does not ship turnkey).
 | Explain credit/funding/collateral moves | XVA | Stage 5 |
 | The actual decomposition | P&L explain / attribution engine | Stage 6 |
 | Prove the explain is accurate | HPL vs RTPL + statistical tests | Stage 7 |
-| Run all of the above at scale | compiled/specialized execution | Stage 8 (cross-cutting) |
+| Sensitivity-based P&L fast path (reuse δ across scenarios) | cached sensitivity vector + dot-product RTPL | Stage 8 (cross-cutting) |
+| Optional: make the one-time δ computation faster | compiled/specialized execution (deprioritized) | Stage 8 (secondary) |
 
 ---
 
@@ -276,11 +277,19 @@ are computed per desk, and a desk fails/passes the PLA tests as expected.
 
 ---
 
-## Stage 8 (cross-cutting) — Performance: JVM bytecode & pricing specialization
+## Stage 8 (cross-cutting) — Performance: sensitivity-vector caching (primary) + optional bytecode
 
 **Goal:** make large-book, many-scenario revaluation (needed for Stage 7) fast enough.
 
 **What changes:**
+
+**Primary strategy — cache the sensitivity vector (sensitivity-based P&L fast path):**
+- After Stage 2 (re-bootstrapped sensitivities), compute the full vector δ = [∂PV/∂f₁ … ∂PV/∂fₙ] (and optionally the gamma/cross matrix Γ) **once per (asOf date, market state, position set)**.
+- Represent each scenario as a factor-move vector Δf; evaluate risk-theoretical P&L as a dot product: `RTPL = δᵀ·Δf` (and `+ ½ ΔfᵀΓΔf` for second order).
+- Never reuse δ across dates or after trade-population changes; the cache key is `(asOfDate, marketState, positionSet)`.
+- Keep HPL **uncached** — it must remain an independent full-revaluation benchmark.
+
+**Secondary (deprioritized) — JVM bytecode & pricing specialization:**
 - New package `com.writhlang.backend.jvm` (mirroring the existing toy `GasBackend`):
   - Compile the (Stages 0–5) instruction DAG to straight-line JVM bytecode (ASM), with primitive
     `double[]` slots instead of boxed `Map[String, Double]`.
@@ -290,13 +299,13 @@ are computed per desk, and a desk fails/passes the PLA tests as expected.
 - Keep the interpreted `Executor` as the reference implementation for correctness tests.
 
 **PLA/explain capability unlocked:** none directly — it is an *enabler* that makes Stage 7
-tractable at production scale (thousands of scenarios × large books × many risk factors).
+tractable at production scale (thousands of scenarios × large books × many risk factors). The caching fast path is the dominant win (n repricings once, then one dot product per scenario); bytecode is a secondary constant-factor win on the repricings.
 
-**ORE gap closed:** ORE is already compiled C++, so it has no interpreter overhead; this stage
-closes the equivalent performance gap for the JVM implementation.
+**ORE gap closed:** ORE is already compiled C++, so it has no interpreter overhead; the sensitivity-vector caching technique is language-independent and is the standard sensitivity-based P&L approach.
+ 
 
-**Acceptance criteria:** bytecode output matches the interpreter bit-for-bit (within tolerance)
-and is measurably faster on the mortgage-heavy and large-FxForward benchmark cases (with warmup).
+**Acceptance criteria:** with one base market state and K scenarios, scenario P&L is computed by reusing a single δ (no per-scenario re-bootstrap/reprice); HPL still recomputes fully; and the cached-δ RTPL matches a per-scenario recomputation within tolerance.
+ 
 
 ---
 
@@ -309,8 +318,8 @@ and is measurably faster on the mortgage-heavy and large-FxForward benchmark cas
 - **5** depends on **1** (market-data objects) and **4** (counterparties are trade attributes).
 - **6** depends on **0–5**.
 - **7** depends on **6**, and benefits from **8** for scale.
-- **8** can start as soon as **1** stabilizes (compile the DAG) and deepen once **2** lands
-  (specialize the re-bootstrapped pricing).
+- **8** (caching) needs **2** (sensitivities) and feeds **6/7**; the optional bytecode part can start once **1** stabilizes (compile the DAG) and deepen once **2** lands.
+ 
 
 ## Risks / open questions
 
@@ -326,6 +335,7 @@ and is measurably faster on the mortgage-heavy and large-FxForward benchmark cas
   `PricingDslSuite` tests continue to run as regression checks.
 - **Turnkey vs platform:** even after Stage 7, the *regulatory* explain is a process (data feeds,
   trade system, sign-off); this plan produces the *engine*, not the operating procedure around it.
+- **Cache invalidation:** the δ/Γ cache is only valid for a fixed (asOf date, market state, position set); stale reuse across dates or trades silently corrupts RTPL. Enforce the key explicitly and add a test that changing the date or a trade invalidates the cache.
 
 
 

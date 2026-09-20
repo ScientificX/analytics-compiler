@@ -1,12 +1,12 @@
 package com.writhlang.engine
 
-import com.writhlang.dsl.{CurveShift, InstrumentSpec}
+import com.writhlang.dsl.InstrumentSpec
+import com.writhlang.marketdata.MarketData
 
 sealed trait Op
 
-/** Price an instrument under a market state: base curve (derived from the
-  * instrument) plus tenor shifts and scalar factor shifts. Leaf node. */
-case class Price(instrument: InstrumentSpec, curveShifts: List[CurveShift], scalar: Map[String, Double]) extends Op
+/** Price an instrument under a market-data snapshot (leaf node). */
+case class Price(instrument: InstrumentSpec, market: MarketData) extends Op
 
 /** Literal shock value. Leaf node. */
 case class Const(value: Double) extends Op

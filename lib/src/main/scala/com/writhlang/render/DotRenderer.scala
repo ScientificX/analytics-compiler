@@ -31,16 +31,14 @@ object DotRenderer {
   }
 
   private def instrumentKey(instr: Instruction): Option[String] = {
-    val parts = instr.id.split(":").toList
-    parts match {
-      case "price" :: "base" :: inst :: Nil => Some(inst)
-      case "price" :: "bump" :: inst :: _ => Some(inst)
-      case "price" :: "cross" :: inst :: _ => Some(inst)
-      case "price" :: "linear" :: inst :: _ => Some(inst)
-      case "price" :: "quad" :: inst :: _ => Some(inst)
-      case "price" :: "full" :: inst :: _ => Some(inst)
-      case "greek" :: _ :: inst :: _ => Some(inst)
-      case _ => None
+    // Instrument-scoped node ids are "<family>:<kind>:<instId>:...". The factor
+    // key portion now contains its own ':' separators (e.g. DiscountCurve:EUR),
+    // so extract the instrument id from its fixed position instead of pattern
+    // matching the whole tail.
+    instr.id.split(":").toList match {
+      case "price" :: _ :: instId :: _ => Some(instId)
+      case "greek" :: _ :: instId :: _ => Some(instId)
+      case _                           => None
     }
   }
 

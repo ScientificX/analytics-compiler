@@ -130,6 +130,8 @@ FxForward under a relative FX spot shock, with no scalar special-casing inside `
 
 ## Stage 2 — Curve bootstrapping & par-conversion (re-bootstrapping)
 
+**Status: DONE** ✅ (implemented: `marketdata.bootstrap` — `ParInstrument`/`QuoteSet`/`Bootstrapper` (deposits/futures/swaps → log-linear-DF bootstrapped curves); `scenario.par` — `CurveShiftParData` + `ParQuoteShift` (bump the quote, re-bootstrap); `ShiftType`/`ShiftScheme` + `SensitivityConfig` (forward/backward/central deltas, central gamma); per-pillar risk keys; `MarketData.curveQuotes`; JSON market-data loader (`MarketDataJson`, ujson); recursive-portfolio DSL; re-keyed `Pricing`. The legacy flat-scalar DSL and `LegacyRiskFactors` were removed.)
+
 **Goal:** build real curves from quoted instruments and compute sensitivities by bumping the
 quote, not the rate.
 

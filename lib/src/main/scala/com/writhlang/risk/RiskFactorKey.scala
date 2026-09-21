@@ -15,6 +15,16 @@ object Tenor {
   def renderYears(years: Double): String =
     if (years == years.toLong.toDouble) years.toLong.toString else years.toString
 
+  private val YearRe  = "^([0-9]+(?:\\.[0-9]+)?)Y$".r
+  private val MonthRe = "^([0-9]+(?:\\.[0-9]+)?)M$".r
+
+  /** Parse a tenor such as `"2Y"` (years) or `"3M"` (months, converted to years). */
+  def parse(segment: String): Either[String, Tenor] = segment match {
+    case YearRe(years)    => Right(Tenor(years.toDouble))
+    case MonthRe(months)  => Right(Tenor(months.toDouble / 12.0))
+    case _                => Left(s"invalid tenor: $segment (expected e.g. 3M, 2Y)")
+  }
+
   implicit final class YearsDoubleSyntax(private val years: Double) extends AnyVal {
     def Y: Tenor = Tenor(years)
   }
@@ -59,12 +69,6 @@ final case class LossLevelDim(level: Double) extends Dimension {
   * currency or, for `FxSpot`, a currency pair) plus optional dimensions such as
   * tenor, expiry, swap tenor, strike, or loss level.
   *
-  * The canonical string is the round-trippable identity of the key, e.g.
-  *   - `DiscountCurve:EUR`            (legacy `rate`)
-  *   - `CreditCurve:EUR`              (legacy `spread`)
-  *   - `DiscountCurve:EUR:5Y`         (a 5-year point on the EUR discount curve)
-  *   - `SwaptionVolatility:EUR:5Yx10Y:ATM`
-  *
   * Two keys are equal iff their canonical strings are equal, which is what makes
   * them safe to embed in DAG node ids and use as map keys.
   */
@@ -91,8 +95,6 @@ final case class RiskFactorKey(
   def canonical: String = {
     val dimParts: List[String] = keyType match {
       case KeyType.SwaptionVolatility =>
-        // Swaption volatility is addressed as "expiry x swapTenor" (one segment)
-        // followed by strike, e.g. "5Yx10Y:ATM".
         val expirySwap = for {
           e <- expiry
           s <- swapTenor
@@ -103,6 +105,9 @@ final case class RiskFactorKey(
     }
     (s"${keyType.name}:$name" :: dimParts).mkString(":")
   }
+
+  /** The same key without its tenor dimension (the curve-level key). */
+  def withoutTenor: RiskFactorKey = copy(tenor = None)
 }
 
 object RiskFactorKey {
@@ -113,8 +118,8 @@ object RiskFactorKey {
   /**
     * Parse a canonical key string back into a [[RiskFactorKey]].
     *
-    * Supported Stage 0 forms:
-    *   - `KeyType:name`                       (no dimensions; legacy keys)
+    * Supported forms:
+    *   - `KeyType:name`                       (no dimensions)
     *   - `DiscountCurve:CCY:5Y`               (single tenor)
     *   - `SwaptionVolatility:CCY:5Yx10Y:ATM`  (expiry x swap tenor + strike)
     */
@@ -130,44 +135,35 @@ object RiskFactorKey {
     }
   }
 
-  private def parseDimensions(
-    keyType: KeyType,
-    name: String,
-    rest: List[String]
-  ): Either[String, RiskFactorKey] = keyType match {
-    case KeyType.SwaptionVolatility =>
-      rest match {
-        case Nil => Right(RiskFactorKey(keyType, name))
-        case List(expirySwap) =>
-          parseExpirySwap(expirySwap).map { case (expiry, swapTenor) =>
-            RiskFactorKey(keyType, name, expiry = Some(expiry), swapTenor = Some(swapTenor))
-          }
-        case List(expirySwap, strikeStr) =>
-          for {
-            es <- parseExpirySwap(expirySwap)
-            st <- parseStrike(strikeStr)
-          } yield RiskFactorKey(keyType, name, expiry = Some(es._1), swapTenor = Some(es._2), strike = Some(st))
-        case _ => Left(s"too many dimensions for SwaptionVolatility key: ${rest.mkString(":")}")
-      }
-    case KeyType.DiscountCurve | KeyType.IndexCurve | KeyType.YieldCurve | KeyType.CreditCurve =>
-      rest match {
-        case Nil => Right(RiskFactorKey(keyType, name))
-        case List(tenorStr) =>
-          parseTenor(tenorStr).map(t => RiskFactorKey(keyType, name, tenor = Some(t)))
-        case _ => Left(s"too many dimensions for ${keyType.name} key: ${rest.mkString(":")}")
-      }
-    case _ =>
-      if (rest.isEmpty) Right(RiskFactorKey(keyType, name))
-      else Left(s"dimensions not supported for ${keyType.name} key: ${rest.mkString(":")}")
-  }
+  private def parseDimensions(keyType: KeyType, name: String, rest: List[String]): Either[String, RiskFactorKey] =
+    keyType match {
+      case KeyType.SwaptionVolatility =>
+        rest match {
+          case Nil => Right(RiskFactorKey(keyType, name))
+          case List(expirySwap) =>
+            parseExpirySwap(expirySwap).map { case (expiry, swapTenor) =>
+              RiskFactorKey(keyType, name, expiry = Some(expiry), swapTenor = Some(swapTenor))
+            }
+          case List(expirySwap, strikeStr) =>
+            for {
+              es <- parseExpirySwap(expirySwap)
+              st <- parseStrike(strikeStr)
+            } yield RiskFactorKey(keyType, name, expiry = Some(es._1), swapTenor = Some(es._2), strike = Some(st))
+          case _ => Left(s"too many dimensions for SwaptionVolatility key: ${rest.mkString(":")}")
+        }
+      case KeyType.DiscountCurve | KeyType.IndexCurve | KeyType.YieldCurve | KeyType.CreditCurve =>
+        rest match {
+          case Nil => Right(RiskFactorKey(keyType, name))
+          case List(tenorStr) =>
+            Tenor.parse(tenorStr).map(t => RiskFactorKey(keyType, name, tenor = Some(t)))
+          case _ => Left(s"too many dimensions for ${keyType.name} key: ${rest.mkString(":")}")
+        }
+      case _ =>
+        if (rest.isEmpty) Right(RiskFactorKey(keyType, name))
+        else Left(s"dimensions not supported for ${keyType.name} key: ${rest.mkString(":")}")
+    }
 
-  private val TenorRe = "^([0-9]+(?:\\.[0-9]+)?)Y$".r
   private val ExpirySwapRe = "^([0-9]+(?:\\.[0-9]+)?)Yx([0-9]+(?:\\.[0-9]+)?)Y$".r
-
-  private def parseTenor(segment: String): Either[String, Tenor] = segment match {
-    case TenorRe(years) => Right(Tenor(years.toDouble))
-    case _              => Left(s"invalid tenor dimension: $segment")
-  }
 
   private def parseExpirySwap(segment: String): Either[String, (Tenor, Tenor)] = segment match {
     case ExpirySwapRe(expiry, swapTenor) => Right((Tenor(expiry.toDouble), Tenor(swapTenor.toDouble)))

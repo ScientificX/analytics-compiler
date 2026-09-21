@@ -37,7 +37,7 @@ final class SensitivityScenarioGenerator(
       val (factor, amount) = ordered(index)
       index += 1
       val direction = if (amount >= 0.0) "up" else "down"
-      Some(Scenario(s"bump:${factor.canonical}:$direction", Map(factor -> shiftFor(factor, amount))))
+      Some(Scenario(s"bump:${factor.canonical}:$direction", Map(factor -> List(shiftFor(factor, amount)))))
     }
   }
 

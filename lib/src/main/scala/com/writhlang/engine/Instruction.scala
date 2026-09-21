@@ -5,19 +5,25 @@ import com.writhlang.marketdata.MarketData
 
 sealed trait Op
 
-/** Price an instrument under a market-data snapshot (leaf node). */
+/** Price an instrument under a market-data snapshot (leaf). */
 case class Price(instrument: InstrumentSpec, market: MarketData) extends Op
 
-/** Literal shock value. Leaf node. */
+/** Literal shock value (leaf). */
 case class Const(value: Double) extends Op
 
-/** First-order sensitivity: (up - down) / (2 * bump). */
-case class Delta(baseId: String, upId: String, downId: String, bump: Double) extends Op
+/** Central-difference delta: (up - down) / (2·bump). */
+case class DeltaCentral(baseId: String, upId: String, downId: String, bump: Double) extends Op
 
-/** Second-order sensitivity: (up - 2*base + down) / bump^2. */
+/** Forward-difference delta: (up - base) / bump. */
+case class DeltaForward(baseId: String, upId: String, bump: Double) extends Op
+
+/** Backward-difference delta: (base - down) / bump. */
+case class DeltaBackward(baseId: String, downId: String, bump: Double) extends Op
+
+/** Gamma (always central): (up - 2·base + down) / bump². */
 case class Gamma(baseId: String, upId: String, downId: String, bump: Double) extends Op
 
-/** Cross second-order sensitivity: (upIJ - upI - upJ + base) / (bumpI * bumpJ). */
+/** Cross gamma (central, two factors): (upIJ - upI - upJ + base) / (bumpI·bumpJ). */
 case class CrossGamma(
   baseId: String,
   upIId: String,

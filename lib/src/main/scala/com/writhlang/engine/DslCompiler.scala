@@ -5,127 +5,82 @@ import com.writhlang.marketdata._
 import com.writhlang.risk._
 import com.writhlang.scenario._
 
+/**
+  * Translates a [[Program]] (portfolio tree + shocks) and a [[MarketData]]
+  * snapshot into a computation [[Dag]].
+  *
+  * Sensitivities are per-pillar: for a quote-backed curve, each par instrument
+  * becomes its own [[RiskFactorKey]] (`DiscountCurve:EUR:2Y`), and a bump is a
+  * par-conversion — bump that quote and re-bootstrap the curve.
+  */
 object DslCompiler {
-  private val rateBump = 0.0001
-  private val spreadBump = 0.0001
-  private val prepayBump = 0.01
-  private val volBump = 0.001
-  private val fxBump = 0.001
 
-  def build(program: Program): Dag = {
+  def build(program: Program, market: MarketData, config: SensitivityConfig = SensitivityConfig()): Dag = {
+    val instruments = flattenInstruments(program.nodes)
     val shockNodes = program.shocks.flatMap(buildShockNodes)
-    val instrumentNodes = program.instruments.flatMap(buildInstrumentNodes(_, program.shocks))
+    val instrumentNodes = instruments.flatMap { case (instr, _) =>
+      buildInstrumentNodes(instr, program.shocks, market, config)
+    }
     Dag((shockNodes ++ instrumentNodes).toMap)
   }
 
+  /** Flatten a recursive portfolio tree into `(instrument, portfolio path)`. */
+  def flattenInstruments(nodes: List[PortfolioNode]): List[(InstrumentSpec, List[String])] = {
+    def walk(node: PortfolioNode, path: List[String]): List[(InstrumentSpec, List[String])] = node match {
+      case InstrumentLeaf(spec) => List((spec, path))
+      case Portfolio(name, children) => children.flatMap(c => walk(c, path :+ name))
+    }
+    nodes.flatMap(walk(_, Nil))
+  }
+
+  /** A `Const` node per scalar (point) shock move. */
   private def buildShockNodes(shock: Shock): List[(String, Instruction)] =
-    shock.factors.toList.flatMap { case (name, value) =>
-      LegacyRiskFactors.fromWord(name).map { key =>
-        val id = shockFactorId(shock.name, key)
-        id -> Instruction(id, Const(value), Nil)
-      }
+    shock.moves.collect { case PointMove(key, _, amount) =>
+      val id = shockFactorId(shock.name, key)
+      id -> Instruction(id, Const(amount), Nil)
     }
 
-  /**
-    * Build the unshocked market-data snapshot for an instrument from its embedded
-    * DSL fields. This is the legacy-DSL compatibility layer: the DSL keeps market
-    * inputs on the instrument spec, and we materialise them into keyed objects.
-    */
-  def baseMarketData(instrument: InstrumentSpec): MarketData = instrument match {
-    case s: BondSpec =>
-      MarketData(curves = Map(
-        LegacyRiskFactors.rate -> Curve.flat(s.rate),
-        LegacyRiskFactors.spread -> Curve.flat(s.spread)
-      ))
-    case s: MortgageSpec =>
-      MarketData(
-        curves = Map(
-          LegacyRiskFactors.rate -> Curve.flat(s.rate),
-          LegacyRiskFactors.spread -> Curve.flat(s.spread)
-        ),
-        prepayVectors = Map(
-          LegacyRiskFactors.prepay -> prepayVector(s.prepayCurve, s.termMonths)
-        )
-      )
-    case s: MbsPoolSpec =>
-      MarketData(
-        curves = Map(
-          LegacyRiskFactors.rate -> Curve.flat(s.rate),
-          LegacyRiskFactors.spread -> Curve.flat(s.spread)
-        ),
-        prepayVectors = Map(
-          LegacyRiskFactors.prepay -> prepayVector(s.prepayCurve, s.wamMonths)
-        )
-      )
-    case s: SwapSpec =>
-      MarketData(curves = Map(
-        LegacyRiskFactors.rate -> Curve.flat(s.rate),
-        LegacyRiskFactors.spread -> Curve.flat(s.spread)
-      ))
-    case s: CapSpec =>
-      MarketData(
-        curves = Map(
-          LegacyRiskFactors.rate -> Curve.flat(s.rate),
-          LegacyRiskFactors.spread -> Curve.flat(s.spread)
-        ),
-        volSurfaces = Map(
-          LegacyRiskFactors.volatility -> VolSurface.flat(s.volatility)
-        )
-      )
-    case s: SwaptionSpec =>
-      MarketData(
-        curves = Map(
-          LegacyRiskFactors.rate -> Curve.flat(s.rate),
-          LegacyRiskFactors.spread -> Curve.flat(s.spread)
-        ),
-        volSurfaces = Map(
-          LegacyRiskFactors.volatility -> VolSurface.flat(s.volatility)
-        )
-      )
-    case s: FxForwardSpec =>
-      MarketData(
-        curves = Map(LegacyRiskFactors.rate -> Curve.flat(s.domesticRate)),
-        fxSpots = Map(LegacyRiskFactors.fx -> SpotQuote(s.fxRate))
-      )
-  }
-
-  private def prepayVector(curve: PrepayCurve, months: Int): PrepayVector = curve match {
-    case FlatPrepay(cpr) => PrepayVector.constant(cpr, months)
-    case RampPrepay(start, end, rampMonths) => PrepayVector.fromRamp(start, end, rampMonths, months)
-  }
-
-  private def buildInstrumentNodes(instrument: InstrumentSpec, shocks: List[Shock]): List[(String, Instruction)] = {
-    val factors = factorsFor(instrument)
-    val baseMarket = baseMarketData(instrument)
-
+  private def buildInstrumentNodes(
+    instrument: InstrumentSpec,
+    shocks: List[Shock],
+    market: MarketData,
+    config: SensitivityConfig
+  ): List[(String, Instruction)] = {
+    val factors = factorsFor(instrument, market)
     val baseId = basePriceId(instrument.id)
-    val base = Instruction(baseId, Price(instrument, baseMarket), Nil)
+    val base = Instruction(baseId, Price(instrument, market), Nil)
 
     // Per-factor up/down bumped prices and delta/gamma.
     val greekNodes = factors.flatMap { key =>
-      val b = bumpFor(key)
-      val upMarket = bumpScenario(key, b).applyTo(baseMarket)
-      val downMarket = bumpScenario(key, -b).applyTo(baseMarket)
+      val b = config.bumpFor(key)
+      val upMarket = bumpScenario(key, b).applyTo(market)
+      val downMarket = bumpScenario(key, -b).applyTo(market)
       val upId = bumpedPriceId(instrument.id, key, "up")
       val downId = bumpedPriceId(instrument.id, key, "down")
       val up = Instruction(upId, Price(instrument, upMarket), Nil)
       val down = Instruction(downId, Price(instrument, downMarket), Nil)
+
       val dId = deltaId(instrument.id, key)
       val gId = gammaId(instrument.id, key)
-      val delta = Instruction(dId, Delta(baseId, upId, downId, b), List(baseId, upId, downId))
+      val (deltaOp, deltaDeps) = config.shiftScheme match {
+        case ShiftScheme.Central  => (DeltaCentral(baseId, upId, downId, b), List(baseId, upId, downId))
+        case ShiftScheme.Forward  => (DeltaForward(baseId, upId, b), List(baseId, upId))
+        case ShiftScheme.Backward => (DeltaBackward(baseId, downId, b), List(baseId, downId))
+      }
+      val delta = Instruction(dId, deltaOp, deltaDeps)
       val gamma = Instruction(gId, Gamma(baseId, upId, downId, b), List(baseId, upId, downId))
       List(upId -> up, downId -> down, dId -> delta, gId -> gamma)
     }
 
-    // Cross gammas for each unordered pair.
+    // Cross gammas for each unordered pair of factors (always central).
     val crossNodes = factors.combinations(2).toList.flatMap {
       case List(k1, k2) =>
-        val b1 = bumpFor(k1)
-        val b2 = bumpFor(k2)
+        val b1 = config.bumpFor(k1)
+        val b2 = config.bumpFor(k2)
         val upIId = bumpedPriceId(instrument.id, k1, "up")
         val upJId = bumpedPriceId(instrument.id, k2, "up")
         val upIJId = crossBumpedPriceId(instrument.id, k1, k2)
-        val upIJMarket = bumpScenario(k2, b2).applyTo(bumpScenario(k1, b1).applyTo(baseMarket))
+        val upIJMarket = bumpScenario(k2, b2).applyTo(bumpScenario(k1, b1).applyTo(market))
         val upIJ = Instruction(upIJId, Price(instrument, upIJMarket), Nil)
         val xId = crossGammaId(instrument.id, k1, k2)
         val cross = Instruction(xId, CrossGamma(baseId, upIId, upJId, upIJId, b1, b2), List(baseId, upIId, upJId, upIJId))
@@ -134,7 +89,7 @@ object DslCompiler {
     }
 
     val scenarioNodes = shocks.flatMap { shock =>
-      buildScenarioNodes(instrument, shock, baseId, factors, baseMarket)
+      buildScenarioNodes(instrument, shock, baseId, factors, market)
     }
 
     (baseId -> base) :: greekNodes ++ crossNodes ++ scenarioNodes
@@ -145,25 +100,23 @@ object DslCompiler {
     shock: Shock,
     baseId: String,
     factors: List[RiskFactorKey],
-    baseMarket: MarketData
+    market: MarketData
   ): List[(String, Instruction)] = {
-    // Full reprice (exact): apply the whole shock as a scenario, then reprice.
-    val fullMarket = shockScenario(shock).applyTo(baseMarket)
+    // Full reprice: apply the whole shock as a scenario, then reprice.
+    val fullMarket = shockScenario(shock).applyTo(market)
     val fullId = fullScenarioId(instrument.id, shock.name)
     val full = Instruction(fullId, Price(instrument, fullMarket), Nil)
 
-    // Risk-factor keys present in this shock (for Taylor terms). The shock's
-    // scalar moves are still stored under the legacy DSL words, so resolve each
-    // key back to its word and check membership.
-    val present = factors.filter(key => LegacyRiskFactors.wordFor(key).exists(shock.factors.contains))
+    // Taylor terms use only the scalar (point) moves present in this shock.
+    val presentKeys = shock.moves.collect { case PointMove(key, _, _) => key }.filter(factors.contains)
 
-    val linearTerms = present.map { key =>
+    val linearTerms = presentKeys.map { key =>
       deltaId(instrument.id, key) -> shockFactorId(shock.name, key)
     }
-    val gammaTerms = present.map { key =>
+    val gammaTerms = presentKeys.map { key =>
       gammaId(instrument.id, key) -> shockFactorId(shock.name, key)
     }
-    val crossTerms = present.combinations(2).toList.map {
+    val crossTerms = presentKeys.combinations(2).toList.map {
       case List(k1, k2) =>
         (crossGammaId(instrument.id, k1, k2),
           shockFactorId(shock.name, k1),
@@ -184,73 +137,78 @@ object DslCompiler {
 
     List(fullId -> full, linId -> lin, quadId -> quad)
   }
-  private def factorsFor(instrument: InstrumentSpec): List[RiskFactorKey] = instrument match {
-    case _: BondSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread)
-    case _: MortgageSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread, LegacyRiskFactors.prepay)
-    case _: MbsPoolSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread, LegacyRiskFactors.prepay)
-    case _: SwapSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread)
-    case _: CapSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread, LegacyRiskFactors.volatility)
-    case _: SwaptionSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.spread, LegacyRiskFactors.volatility)
-    case _: FxForwardSpec => List(LegacyRiskFactors.rate, LegacyRiskFactors.fx)
+
+  /** The risk factors for an instrument: curve pillars + direct (prepay/vol/fx) keys. */
+  def factorsFor(instrument: InstrumentSpec, market: MarketData): List[RiskFactorKey] =
+    curveKeysFor(instrument).flatMap(k => pillarKeys(k, market)) ++ directKeysFor(instrument)
+
+  private def curveKeysFor(instrument: InstrumentSpec): List[RiskFactorKey] = instrument match {
+    case s: BondSpec      => List(s.discountCurve, s.creditCurve)
+    case s: MortgageSpec  => List(s.discountCurve, s.creditCurve)
+    case s: MbsPoolSpec   => List(s.discountCurve, s.creditCurve)
+    case s: SwapSpec      => List(s.discountCurve, s.creditCurve)
+    case s: CapSpec       => List(s.discountCurve, s.creditCurve)
+    case s: SwaptionSpec  => List(s.discountCurve, s.creditCurve)
+    case s: FxForwardSpec => List(s.domesticCurve, s.foreignCurve)
   }
 
-  private def bumpFor(key: RiskFactorKey): Double = key.keyType match {
-    case KeyType.DiscountCurve => rateBump
-    case KeyType.CreditCurve => spreadBump
-    case KeyType.Prepay => prepayBump
-    case KeyType.SwaptionVolatility | KeyType.CapFloorVolatility => volBump
-    case KeyType.FxSpot => fxBump
-    case _ => 0.0
+  private def directKeysFor(instrument: InstrumentSpec): List[RiskFactorKey] = instrument match {
+    case s: MortgageSpec  => List(s.prepayCurve)
+    case s: MbsPoolSpec   => List(s.prepayCurve)
+    case s: CapSpec       => List(s.volSurface)
+    case s: SwaptionSpec  => List(s.volSurface)
+    case s: FxForwardSpec => List(s.fxSpot)
+    case _                => Nil
   }
 
-  /** The scenario shift corresponding to a single-factor perturbation. */
-  private def scenarioShiftFor(key: RiskFactorKey, amount: Double): ScenarioShift = key.keyType match {
-    case KeyType.DiscountCurve | KeyType.CreditCurve => AdditiveShift(Flat(amount))
-    case KeyType.Prepay => AdditiveShift(Flat(amount))
-    case KeyType.SwaptionVolatility | KeyType.CapFloorVolatility => AdditiveShift(Flat(amount))
-    case KeyType.FxSpot => RelativeSpotShift(amount)
-    case _ => AdditiveShift(Flat(0.0))
-  }
+  /** One key per par instrument for a quote-backed curve; the curve key otherwise. */
+  private def pillarKeys(curveKey: RiskFactorKey, market: MarketData): List[RiskFactorKey] =
+    market.curveQuotes.get(curveKey) match {
+      case Some(quotes) => quotes.instruments.map(i => curveKey.copy(tenor = Some(Tenor(i.tenorYears))))
+      case None         => List(curveKey)
+    }
 
-  /** A single-factor bump scenario (used for up/down finite differences). */
-  private def bumpScenario(key: RiskFactorKey, amount: Double): Scenario =
-    Scenario(s"bump:${key.canonical}:$amount", Map(key -> scenarioShiftFor(key, amount)))
+  /** The market-object key + shift for a single-factor perturbation. */
+  private def scenarioShiftFor(key: RiskFactorKey, shiftType: ShiftType, amount: Double): (RiskFactorKey, ScenarioShift) =
+    key.keyType match {
+      case KeyType.DiscountCurve | KeyType.IndexCurve | KeyType.YieldCurve | KeyType.CreditCurve =>
+        val curveKey = key.withoutTenor
+        key.tenor match {
+          case Some(t) => curveKey -> ParQuoteShift(t.years, amount)
+          case None    => curveKey -> AdditiveShift(Flat(amount))
+        }
+      case KeyType.Prepay =>
+        key -> AdditiveShift(Flat(amount))
+      case KeyType.SwaptionVolatility | KeyType.CapFloorVolatility |
+           KeyType.FxVolatility | KeyType.EquityVolatility | KeyType.CommodityVolatility =>
+        key -> AdditiveShift(Flat(amount))
+      case KeyType.FxSpot | KeyType.EquitySpot =>
+        key -> (if (shiftType == ShiftType.Relative) RelativeSpotShift(amount) else AbsoluteSpotShift(amount))
+      case _ => key -> AdditiveShift(Flat(0.0))
+    }
+
+  /** A single-factor bump scenario (for up/down finite differences). */
+  private def bumpScenario(key: RiskFactorKey, amount: Double): Scenario = {
+    val (marketKey, shift) = scenarioShiftFor(key, ShiftType.defaultFor(key.keyType), amount)
+    Scenario(s"bump:${key.canonical}:$amount", Map(marketKey -> List(shift)))
+  }
 
   /** Translate a DSL curve shift into a scenario shift shape. */
-  private def curveShape(shift: CurveShift): Option[ShiftShape] = shift match {
-    case NoCurveShift => None
-    case FlatShift(amount) => Some(Flat(amount))
-    case BucketShift(tenorYears, amount) => Some(Bucket(tenorYears, amount))
-    case TwistShift(shortAmount, longAmount, pivotYears) => Some(Twist(shortAmount, longAmount, pivotYears))
-  }
-
-  private def sumShapes(shapes: List[ShiftShape]): ShiftShape = shapes match {
-    case Nil => Flat(0.0)
-    case single :: Nil => single
-    case multiple => Custom(x => multiple.map(_.at(x)).sum)
+  private def shapeToShiftShape(shift: CurveShift): ShiftShape = shift match {
+    case NoCurveShift                    => Flat(0.0)
+    case FlatShift(amount)               => Flat(amount)
+    case BucketShift(tenorYears, amount) => Bucket(tenorYears, amount)
+    case TwistShift(short, long, pivot)  => Twist(short, long, pivot)
+    case SineShift(amp, omega, phase)    => Sine(amp, omega, phase)
   }
 
   /** Full market transformation for a shock (used for exact re-pricing). */
   private def shockScenario(shock: Shock): Scenario = {
-    // Rate risk: the discount curve gets the scalar `rate` move plus any curve
-    // shifts (parallel/bucket/twist), combined additively on the same key.
-    val rateShapes: List[ShiftShape] =
-      shock.factors.get("rate").map(v => Flat(v): ShiftShape).toList ++
-        shock.curve.flatMap(curveShape)
-    val rateShift: List[(RiskFactorKey, ScenarioShift)] =
-      if (rateShapes.isEmpty) Nil
-      else List(LegacyRiskFactors.rate -> AdditiveShift(sumShapes(rateShapes)))
-
-    val spreadShift: List[(RiskFactorKey, ScenarioShift)] =
-      shock.factors.get("spread").map(v => LegacyRiskFactors.spread -> AdditiveShift(Flat(v))).toList
-    val prepayShift: List[(RiskFactorKey, ScenarioShift)] =
-      shock.factors.get("prepay").map(v => LegacyRiskFactors.prepay -> AdditiveShift(Flat(v))).toList
-    val volShift: List[(RiskFactorKey, ScenarioShift)] =
-      shock.factors.get("volatility").map(v => LegacyRiskFactors.volatility -> AdditiveShift(Flat(v))).toList
-    val fxShift: List[(RiskFactorKey, ScenarioShift)] =
-      shock.factors.get("fx").map(v => LegacyRiskFactors.fx -> RelativeSpotShift(v)).toList
-
-    Scenario(shock.name, (rateShift ++ spreadShift ++ prepayShift ++ volShift ++ fxShift).toMap)
+    val grouped: Map[RiskFactorKey, List[ScenarioShift]] = shock.moves.map {
+      case PointMove(key, shiftType, amount) => scenarioShiftFor(key, shiftType, amount)
+      case ShapeMove(key, shape)             => key -> AdditiveShift(shapeToShiftShape(shape))
+    }.groupMap(_._1)(_._2)
+    Scenario(shock.name, grouped)
   }
 
   // --- id helpers ---
@@ -265,9 +223,5 @@ object DslCompiler {
   def linearScenarioId(instId: String, shockName: String): String = s"price:linear:$instId:$shockName"
   def quadraticScenarioId(instId: String, shockName: String): String = s"price:quad:$instId:$shockName"
   def fullScenarioId(instId: String, shockName: String): String = s"price:full:$instId:$shockName"
-
-  /** Legacy alias: a scenario price now refers to the full re-priced value. */
-  def scenarioPriceId(instId: String, shockName: String): String = fullScenarioId(instId, shockName)
 }
-
 

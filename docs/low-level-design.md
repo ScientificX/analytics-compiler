@@ -1,368 +1,337 @@
 # WrithLang Low-Level Design
 
-This document is the **low-level design reference**. It documents, component by component, the **public API** (types, functions, signatures), the **shapes of the data** flowing between components, and — for software engineers with no finance background — the **plain-language meaning** of every pricing concept and formula. It complements [architecture.md](architecture.md) (the pipeline and data flow) and [dsl-reference.md](dsl-reference.md) (the DSL surface grammar). Finance terms are defined in place or in the finance glossary in [AGENTS.md](../AGENTS.md).
+This document is the **low-level design reference**: the public API (types, signatures), the shapes of data flowing between components, and — for software engineers with no finance background — the plain-language meaning of every pricing concept and formula. It complements [architecture.md](architecture.md) (the pipeline) and [dsl-reference.md](dsl-reference.md) (the DSL grammar). Finance terms are defined in place or in the glossary in [AGENTS.md](../AGENTS.md).
 
-## 1. Conventions for reading this document
+## 1. Conventions
 
-- **Rates are decimals, not percentages.** `0.04` means 4%. A rate is an *annual* decimal unless the name says otherwise (`rateMonthly` = per-month).
-- **Time bases are explicit in names.** `maturityYears`, `expiryYears`, `tenorYears` are years; `termMonths`, `wamMonths`, `rampMonths` are months.
-- **Effect separation.** Pure functions return `Either[String, A]`; effectful/parallel work returns a ZIO `IO[E, A]`. The parser and compiler are pure; the executor is effectful.
-- **"API structure"** means the public case classes / sealed traits (the input & output *shapes*), the public functions with their signatures, and how they map together.
-- **Sign convention.** A *positive* shock moves a factor up (rate up, spread up, volatility up, prepayment up, FX spot up). Whether that raises or lowers a price depends on the instrument (documented per model in §4.6).
+- **Rates are decimals, not percentages.** `0.04` means 4%.
+- **Time bases are explicit in names.** `maturityYears`/`expiryYears`/`tenorYears` are years; `termMonths`/`wamMonths` are months.
+- **Effect separation.** Pure functions return `Either[String, A]`; the executor is effectful (`zio.IO`).
+- **Sign convention.** A positive shock moves a factor up (rate up, spread up, volatility up, prepayment up, FX spot up).
+- **A curve is derived, never stored.** Market data holds *quotes*; a `Curve` is bootstrapped from them.
 
-## 2. The pipeline at a glance
+## 2. Pipeline at a glance
 
 | Stage | Component | Input | Output |
-| ----- | --------- | ----- | ------ |
-| Parse | `dsl.Parser.parseProgram` | `String` (DSL source) | `Either[String, dsl.Program]` |
-| Compile | `engine.DslCompiler.build` | `dsl.Program` | `engine.Dag` |
+| --- | --- | --- | --- |
+| Parse market data | `marketdata.MarketDataJson.parse` | `String` (JSON) | `Either[String, MarketData]` |
+| Parse DSL | `dsl.Parser.parseProgram` | `String` | `Either[String, dsl.Program]` |
+| Compile | `engine.DslCompiler.build` | `Program`, `MarketData`, `SensitivityConfig` | `engine.Dag` |
 | Execute | `engine.Executor.run` | `engine.Dag` | `zio.IO[ExecutionError, Map[String, Double]]` |
 | Render | `render.DotRenderer.toDot` | `engine.Dag` | `String` (Graphviz DOT) |
-
-The execution result is a `Map[String, Double]` keyed by **node id** (see §9): one number per shock literal, price, Greek, or scenario price.
 
 ## 3. `com.writhlang.dsl` — AST and parser
 
 Source: `dsl/Ast.scala`, `dsl/Parser.scala`.
 
-### 3.1 AST (`Ast.scala`)
+### 3.1 AST
 
-The AST is a set of immutable case classes that mirror the DSL; there is no logic, only shapes.
+```scala
+sealed trait InstrumentSpec { def id: String }
 
-**Curve shifts** — how a discount curve is deformed by a shock:
+case class BondSpec(id, notional, coupon, maturityYears: Int,
+                    discountCurve: RiskFactorKey, creditCurve: RiskFactorKey, couponFreq: Int)
+case class MortgageSpec(id, notional, noteRate, termMonths: Int,
+                        discountCurve: RiskFactorKey, creditCurve: RiskFactorKey, prepayCurve: RiskFactorKey)
+case class MbsPoolSpec(id, notional, wac, wamMonths: Int,
+                       discountCurve: RiskFactorKey, creditCurve: RiskFactorKey, prepayCurve: RiskFactorKey)
+case class SwapSpec(id, notional, fixedRate, maturityYears: Int,
+                    discountCurve: RiskFactorKey, creditCurve: RiskFactorKey, freq: Int)
+case class CapSpec(id, notional, strike, maturityYears: Int, freq: Int,
+                   discountCurve: RiskFactorKey, creditCurve: RiskFactorKey, volSurface: RiskFactorKey)
+case class SwaptionSpec(id, notional, strike, expiryYears, swapMaturityYears: Int, freq: Int,
+                        isPayer: Boolean, discountCurve: RiskFactorKey,
+                        creditCurve: RiskFactorKey, volSurface: RiskFactorKey)
+case class FxForwardSpec(id, notional, fxRate, maturityYears,
+                         domesticCurve: RiskFactorKey, foreignCurve: RiskFactorKey, fxSpot: RiskFactorKey)
+```
+
+`notional`, `coupon`, `noteRate`, `fixedRate`, `strike`, `fxRate` are **trade terms** (contractual). The `RiskFactorKey` fields are **market references** — the instrument says *which* market object to price with, but the object's value comes from `MarketData`.
 
 ```scala
 sealed trait CurveShift
-case object NoCurveShift        extends CurveShift  // no change
-case class FlatShift(amount: Double) extends CurveShift                 // +amount at every tenor
-case class BucketShift(tenorYears: Double, amount: Double) extends CurveShift  // local bump, width 1y
-case class TwistShift(shortAmount: Double, longAmount: Double, pivotYears: Double) extends CurveShift
+case object NoCurveShift; case class FlatShift(amount); case class BucketShift(tenorYears, amount)
+case class TwistShift(shortAmount, longAmount, pivotYears); case class SineShift(amplitude, omega, phase)
+
+sealed trait ShockMove
+case class PointMove(key: RiskFactorKey, shiftType: ShiftType, amount: Double) extends ShockMove
+case class ShapeMove(key: RiskFactorKey, shape: CurveShift) extends ShockMove
+
+case class Shock(name: String, moves: List[ShockMove])
+
+sealed trait PortfolioNode
+case class InstrumentLeaf(spec: InstrumentSpec) extends PortfolioNode
+case class Portfolio(name: String, children: List[PortfolioNode]) extends PortfolioNode
+
+case class Program(shocks: List[Shock], nodes: List[PortfolioNode])
 ```
 
-Finance meaning: a *curve shift* moves interest rates of different maturities by different amounts. `parallel` moves all maturities equally; `bucket` moves only rates near one tenor (a tent that fades to zero one year away); `twist` rotates the curve around a pivot maturity.
-
-**Prepayment curves**:
-
-```scala
-sealed trait PrepayCurve
-case class FlatPrepay(cpr: Double) extends PrepayCurve
-case class RampPrepay(startCpr: Double, endCpr: Double, rampMonths: Int) extends PrepayCurve
-```
-
-**Instrument specs** (sealed `InstrumentSpec`, each with `id: String`):
-
-| Case class | Fields | Finance meaning |
-| ---------- | ------ | --------------- |
-| `BondSpec` | `id`, `notional`, `coupon`, `maturityYears: Int`, `rate`, `spread`, `couponFreq: Int` | Fixed-coupon bond. |
-| `MortgageSpec` | `id`, `notional`, `rate`, `spread`, `termMonths: Int`, `prepayCurve` | Amortizing mortgage loan. |
-| `MbsPoolSpec` | `id`, `notional`, `rate`, `spread`, `wac`, `wamMonths: Int`, `prepayCurve` | Pass-through MBS pool (WAC/WAM). |
-| `SwapSpec` | `id`, `notional`, `rate`, `spread`, `fixedRate`, `maturityYears: Int`, `freq: Int` | Interest-rate swap. |
-| `CapSpec` | `id`, `notional`, `rate`, `spread`, `strike`, `maturityYears: Int`, `freq: Int`, `volatility` | Interest-rate cap. |
-| `SwaptionSpec` | `id`, `notional`, `rate`, `spread`, `strike`, `expiryYears: Double`, `swapMaturityYears: Int`, `freq: Int`, `volatility`, `isPayer: Boolean` | Option to enter a swap. |
-| `FxForwardSpec` | `id`, `notional`, `domesticRate`, `fxRate`, `foreignRate`, `maturityYears: Double` | FX forward. |
-
-Field-by-field units and meaning (all `Double` unless noted):
-
-- `notional` — the face amount cashflows are computed on.
-- `coupon` — annual interest, decimal (`0.05` = 5%).
-- `couponFreq` / `freq` — payments per year.
-- `maturityYears` — years until final cashflow.
-- `rate` — base discount rate, annual decimal.
-- `spread` — extra yield for credit/liquidity risk, annual decimal; added to `rate`.
-- `termMonths` / `wamMonths` — months until final cashflow.
-- `wac` / `wam` — weighted-average coupon / weighted-average maturity of a mortgage pool.
-- `strike` — the option's exercise rate.
-- `volatility` — annualised volatility of rates, input to Black's model.
-- `expiryYears` — time until the swaption can be exercised.
-- `swapMaturityYears` — tenor of the swap the swaption delivers.
-- `isPayer` — `true` = payer swaption (right to pay fixed), `false` = receiver.
-- `domesticRate` / `foreignRate` — the two interest rates in an FX forward.
-- `fxRate` — spot exchange rate (domestic per foreign, e.g. USD per EUR).
-
-**Shock and Program**:
-
-```scala
-case class Shock(name: String, factors: Map[String, Double], curve: List[CurveShift])
-case class Program(shocks: List[Shock], instruments: List[InstrumentSpec])
-```
-
-A `Shock` is a named bundle of market moves: `factors` maps a scalar factor word (`rate`, `spread`, `prepay`, `volatility`, `fx`) to its move; `curve` holds any curve shifts. A `Program` is the whole document.
-
-### 3.2 Parser (`Parser.scala`)
+### 3.2 Parser
 
 ```scala
 object Parser {
   def parseProgram(input: String): Either[String, Program]
-  // also: validateInstrument(...) — per-instrument field checks
 }
 ```
 
-`parseProgram` parses the DSL text (FastParse) then validates every instrument, aggregating errors into a single `; `-separated `Left` message. Input shape: raw DSL text (grammar in [dsl-reference.md](dsl-reference.md)). Output shape: `Either[String, Program]`.
+`parseProgram` parses the DSL (FastParse) and validates every instrument, aggregating errors into a `; `-separated `Left`.
 
-## 4. `com.writhlang.engine` — the computation engine
+## 4. `com.writhlang.risk` — taxonomy
 
-### 4.1 Instruction model (`Instruction.scala`)
-
-A computation DAG node is `Instruction(id, op, deps)`:
+Source: `risk/KeyType.scala`, `risk/RiskFactorKey.scala`, `risk/ShiftType.scala`.
 
 ```scala
-case class Instruction(id: String, op: Op, deps: List[String])
+sealed trait KeyType { def name: String }        // DiscountCurve, CreditCurve, FxSpot, SwaptionVolatility, Prepay, …
+final case class Tenor(years: Double)            // canonical "5Y"; Tenor.parse("3M") == Tenor(0.25)
+final case class RiskFactorKey(keyType: KeyType, name: String,
+                               tenor: Option[Tenor] = None, expiry: Option[Tenor] = None,
+                               swapTenor: Option[Tenor] = None, strike: Option[Strike] = None,
+                               lossLevel: Option[Double] = None) {
+  def canonical: String        // "DiscountCurve:EUR:2Y"
+  def withoutTenor: RiskFactorKey
+}
+object RiskFactorKey { def parse(canonical: String): Either[String, RiskFactorKey] }
+
+sealed trait ShiftType { def name: String }       // Absolute | Relative
+object ShiftType { def defaultFor(keyType: KeyType): ShiftType }  // rates/prepay -> Absolute; fx/vol -> Relative
 ```
 
-- `id` — a deterministic string key (see §9).
-- `deps` — ids of nodes that must be evaluated first.
-- `op` — the operation to perform.
+Two keys are equal iff their `canonical` strings are equal, so they are safe as map keys and in DAG node ids.
 
-`Op` is a sealed trait; each case is either a leaf (no deps) or a derived value (whose inputs are listed in `deps`):
+## 5. `com.writhlang.marketdata` — market-data objects
+
+### 5.1 `Curve`
+
+```scala
+trait Curve {
+  def rateAt(tenorYears: Double): Double                 // annual zero rate (decimal)
+  def df(tenorYears: Double): Double = math.exp(-rateAt(tenorYears) * tenorYears)
+  def shifted(delta: Double => Double): Curve
+  def plus(other: Curve): Curve
+}
+object Curve {
+  def flat(rate: Double): Curve                          // a flat curve (e.g. a credit spread)
+  def function(f: Double => Double): Curve
+}
+final case class BootstrappedCurve(pillars: Vector[(Double, Double)]) extends Curve
+```
+
+`BootstrappedCurve` is a curve built from quoted instruments, represented by its pillar points `(tenorYears, discountFactor)` and interpolated log-linearly in discount factors (flat forward) by `DiscountCurveInterpolator`.
+
+### 5.2 `MarketData`
+
+```scala
+final case class MarketData(
+  curves: Map[RiskFactorKey, Curve] = Map.empty,
+  curveQuotes: Map[RiskFactorKey, QuoteSet] = Map.empty,
+  volSurfaces: Map[RiskFactorKey, VolSurface] = Map.empty,
+  prepayVectors: Map[RiskFactorKey, PrepayVector] = Map.empty,
+  fxSpots: Map[RiskFactorKey, SpotQuote] = Map.empty,
+  correlations: Map[RiskFactorKey, CorrelationMatrix] = Map.empty
+) {
+  def curve(key): Curve; def quotes(key): QuoteSet
+  def combinedCurve(discountKey, creditKey): Curve   // discount.plus(credit)
+  def withCurveAndQuotes(key, curve, quotes): MarketData
+  // withCurve / withVolSurface / withPrepayVector / withFxSpot / withCorrelation
+}
+```
+
+`curveQuotes` is the *input* (par instruments); `curves` is the *derived* result. A shock transforms the quotes and re-bootstraps.
+
+### 5.3 Other market-data objects
+
+```scala
+final case class VolSurface(volAt: (Double, Double) => Double) { def volatility(expiry, strike): Double; def shifted(delta): VolSurface }
+object VolSurface { def flat(volatility: Double): VolSurface }
+
+final case class PrepayVector(values: Vector[Double]) { def months: Int; def cpr(monthIndex: Int): Double; def shifted(delta): PrepayVector }
+object PrepayVector { def constant(cpr, months): PrepayVector; def fromRamp(start, end, rampMonths, months): PrepayVector }
+
+final case class SpotQuote(value: Double) { def shiftedRelative(amount): SpotQuote; def shiftedAbsolute(amount): SpotQuote }
+
+final case class CorrelationMatrix(labels: Vector[String], values: Vector[Vector[Double]]) { def apply(i, j): Double }
+```
+
+### 5.4 `marketdata.bootstrap`
+
+```scala
+sealed trait ParInstrument { def rate: Double; def tenorYears: Double; def maturityYears: Double; def withRate(r): ParInstrument }
+case class Deposit(tenor: Tenor, rate: Double) extends ParInstrument      // continuous: df(T) = e^(-r·T)
+case class Future(start: Tenor, end: Tenor, rate: Double) extends ParInstrument // df(end) = df(start)·e^(-r·(end-start))
+case class Swap(tenor: Tenor, rate: Double, freq: Int = 1) extends ParInstrument  // par equation
+
+final case class QuoteSet(instruments: List[ParInstrument]) {
+  def sorted: List[ParInstrument]
+  def shifted(delta: Double => Double): QuoteSet
+  def shiftOne(tenorYears: Double, amount: Double): QuoteSet
+}
+
+object Bootstrapper {
+  def bootstrap(quotes: QuoteSet): Either[String, BootstrappedCurve]
+  def bootstrapOrThrow(quotes: QuoteSet): BootstrappedCurve
+}
+```
+
+`bootstrap` walks instruments in maturity order, solving one discount factor per instrument; returns `Left` on a non-positive or non-decreasing discount factor.
+
+### 5.5 `MarketDataJson`
+
+```scala
+object MarketDataJson { def parse(json: String): Either[String, MarketData] }
+```
+
+Loads the JSON schema documented in [dsl-reference.md](dsl-reference.md). A curve entry is either `{ "type": ..., "instruments": [...] }` (bootstrapped) or `{ "type": ..., "flat": rate }` (flat).
+
+## 6. `com.writhlang.scenario` — shocks & sensitivities
+
+### 6.1 `ShiftShape`
+
+```scala
+sealed trait ShiftShape { def at(x: Double): Double }
+case class Flat(amount); case class Bucket(tenor, amount); case class Twist(short, long, pivot)
+case class Sine(amplitude, omega, phase); case class Custom(f: Double => Double)
+```
+
+### 6.2 `Scenario`
+
+```scala
+sealed trait ScenarioShift
+case class AdditiveShift(shape: ShiftShape) extends ScenarioShift
+case class ParQuoteShift(tenorYears: Double, amount: Double) extends ScenarioShift
+case class RelativeSpotShift(amount: Double) extends ScenarioShift
+case class AbsoluteSpotShift(amount: Double) extends ScenarioShift
+
+final case class Scenario(name: String, shifts: List[(RiskFactorKey, ScenarioShift)]) {
+  def applyTo(market: MarketData): MarketData
+}
+```
+
+`applyTo` transforms the snapshot: for a quote-backed curve, `AdditiveShift` applies the shape to each quote and re-bootstraps; `ParQuoteShift` bumps one quote and re-bootstraps. A shock shocks the market *input* (quotes), then re-derives the curve.
+
+### 6.3 `SensitivityConfig` / `ShiftScheme`
+
+```scala
+sealed trait ShiftScheme { def name: String }   // Forward | Backward | Central
+final case class SensitivityConfig(shiftScheme: ShiftScheme = ShiftScheme.Central,
+                                   bumpFor: RiskFactorKey => Double = SensitivityConfig.defaultBump)
+```
+
+`defaultBump` is `1e-4` for rates/spreads (1bp), `1e-2` for prepay, `1e-3` for vol/fx.
+
+### 6.4 `ScenarioGenerator`
+
+```scala
+trait ScenarioGenerator { def next(): Option[Scenario]; def reset(): Unit }
+final class SensitivityScenarioGenerator(factors, bumpFor, shiftFor) extends ScenarioGenerator
+final class ListScenarioGenerator(scenarios: List[Scenario]) extends ScenarioGenerator
+```
+
+### 6.5 `scenario.par`
+
+```scala
+final case class CurveShiftParData(curveKey: RiskFactorKey, parTenorYears: Double)
+```
+
+Maps a pillar to the par instrument whose quote is bumped (par-conversion).
+
+## 7. `com.writhlang.engine`
+
+### 7.1 Instruction model
 
 ```scala
 sealed trait Op
-case class Price(instrument: InstrumentSpec, curveShifts: List[CurveShift], scalar: Map[String, Double]) extends Op
+case class Price(instrument: InstrumentSpec, market: MarketData) extends Op
 case class Const(value: Double) extends Op
-case class Delta(baseId: String, upId: String, downId: String, bump: Double) extends Op
-case class Gamma(baseId: String, upId: String, downId: String, bump: Double) extends Op
-case class CrossGamma(baseId: String, upIId: String, upJId: String, upIJId: String, bumpI: Double, bumpJ: Double) extends Op
-case class LinearScenario(baseId: String, terms: List[(String, String)]) extends Op
-case class QuadraticScenario(baseId: String, linear: List[(String, String)], gamma: List[(String, String)], cross: List[(String, String, String)]) extends Op
+case class DeltaCentral(baseId, upId, downId, bump) extends Op
+case class DeltaForward(baseId, upId, bump) extends Op
+case class DeltaBackward(baseId, downId, bump) extends Op
+case class Gamma(baseId, upId, downId, bump) extends Op
+case class CrossGamma(baseId, upIId, upJId, upIJId, bumpI, bumpJ) extends Op
+case class LinearScenario(baseId, terms: List[(String, String)]) extends Op
+case class QuadraticScenario(baseId, linear, gamma, cross) extends Op
+case class Instruction(id: String, op: Op, deps: List[String])
 ```
 
-Finance meaning of each `Op`:
-
-| Op | Formula | Plain-language meaning |
-| -- | ------- | ---------------------- |
-| `Const(v)` | `v` | A literal shock value (leaf). |
-| `Price(...)` | full repricing | Re-price an instrument under a market state (leaf). |
-| `Delta` | `(up − down) / (2·bump)` | Central-difference estimate of the *first* derivative: how fast price changes per unit of a risk factor. |
-| `Gamma` | `(up − 2·base + down) / bump²` | Second derivative: how fast the delta itself changes (convexity). |
-| `CrossGamma` | `(upIJ − upI − upJ + base) / (bumpI·bumpJ)` | Mixed second derivative between two factors. |
-| `LinearScenario` | `base + Σ (delta_i · shock_i)` | First-order (linear Taylor) approximation of a shocked price. |
-| `QuadraticScenario` | linear + `½ Σ gamma_i·shock_i²` + `Σ cross_ij·shock_i·shock_j` | Second-order (quadratic Taylor) approximation. |
-
-`Delta` and `Gamma` are the "Greeks" — sensitivities used in risk management. A delta of `X` means "if the factor moves up by a full unit, the price moves by about `X`."
-
-### 4.2 DAG (`Dag.scala`)
+### 7.2 `Dag`
 
 ```scala
-case class Dag(nodes: Map[String, Instruction]) {
-  def levels: Either[String, List[List[Instruction]]]
-}
+case class Dag(nodes: Map[String, Instruction]) { def levels: Either[String, List[List[Instruction]]] }
 ```
 
-`levels` does a Kahn-style topological sort: `Left("cycle detected in instruction DAG")` if there is a cycle, otherwise an ordered list of *levels*, where each level is a list of nodes whose dependencies are all satisfied by earlier levels. Nodes within a level are independent and can run in parallel.
-
-### 4.3 DAG construction (`DslCompiler.scala`)
+### 7.3 `DslCompiler`
 
 ```scala
 object DslCompiler {
-  def build(program: Program): Dag
-  // deterministic node-id helpers (see §9), plus factorsFor / bumpFor / perturb / shockMarket
+  def build(program: Program, market: MarketData, config: SensitivityConfig = SensitivityConfig()): Dag
+  def flattenInstruments(nodes: List[PortfolioNode]): List[(InstrumentSpec, List[String])]
+  def factorsFor(instrument: InstrumentSpec, market: MarketData): List[RiskFactorKey]
+  // node-id helpers: basePriceId, deltaId, gammaId, crossGammaId, bumpedPriceId,
+  //   crossBumpedPriceId, shockFactorId, linearScenarioId, quadraticScenarioId, fullScenarioId
 }
 ```
 
-`build` produces, for every shock, a `Const` node per scalar factor; and for every instrument:
+`factorsFor` returns one `RiskFactorKey` per par instrument of each referenced curve (per-pillar) plus the direct keys (prepay/vol/fx). `build` emits base price, per-factor up/down bumped prices + delta/gamma, cross-gammas, and per-shock full/linear/quadratic scenario nodes.
 
-1. a **base price** node (`Price` with no shifts),
-2. **Greek nodes**: for each risk factor, up/down bumped prices plus `Delta`/`Gamma`; plus `CrossGamma` for every unordered pair of factors,
-3. **scenario nodes**: for each shock, a full reprice, a linear Taylor, and a quadratic Taylor.
-
-Risk factors per instrument (`factorsFor`):
-
-| Instrument | Risk factors |
-| ---------- | ------------ |
-| bond, swap | `rate`, `spread` |
-| mortgage, mbs | `rate`, `spread`, `prepay` |
-| cap, swaption | `rate`, `spread`, `volatility` |
-| fxforward | `rate`, `fx` |
-
-Finite-difference bump sizes (`bumpFor`): rate/spread `1e-4` (1 basis point), prepay `1e-2`, volatility `1e-3`, fx `1e-3`. A basis point (bp) is one-hundredth of a percent = `1e-4` in decimal.
-
-`perturb(key, amount)` translates a factor move to the right place: `rate`/`spread` become a `FlatShift` on the discount curve; `prepay`/`volatility`/`fx` become scalar entries consumed by `Pricing.price`.
-
-`shockMarket(shock)` builds the full market state for exact repricing: `rate`/`spread` → flat curve shifts; `prepay`/`volatility`/`fx` → scalar map; plus any `curve` shifts from the shock.
-
-### 4.4 Executor (`Executor.scala`)
+### 7.4 `Executor`
 
 ```scala
 object Executor {
   sealed trait ExecutionError { def message: String }
-  case class MissingDependency(node: String, dep: String) extends ExecutionError
-  case class GraphError(reason: String) extends ExecutionError
-
+  case class MissingDependency(node, dep) extends ExecutionError
+  case class GraphError(reason) extends ExecutionError
   def run(dag: Dag): zio.IO[ExecutionError, Map[String, Double]]
 }
 ```
 
-`run` topologically sorts the DAG, then processes each level in sequence, evaluating the nodes *within* a level in parallel (`ZIO.foreachPar`) and accumulating results in a `Ref[Map[String, Double]]`. Each `Op` is evaluated by `evalInstruction`, reading dependency values from the accumulated map. A missing dependency yields `MissingDependency`; an unresolvable graph yields `GraphError`.
-
-### 4.5 Discount curve (`Curve.scala`)
-
-```scala
-object Curve {
-  def shiftAt(shift: CurveShift, tenorYears: Double): Double
-}
-
-case class DiscountCurve(baseFlat: Double, shifts: List[CurveShift]) {
-  def rateAt(tenorYears: Double): Double   // baseFlat + Σ shiftAt(...)
-  def df(tenorYears: Double): Double       // exp(−rateAt(tenorYears) · tenorYears)
-}
-
-object DiscountCurve {
-  def flat(rate: Double): DiscountCurve
-}
-```
-
-Finance meaning: a **discount curve** is the function that turns a future time `t` into a **discount factor** `df(t) = e^(−r(t)·t)`. A discount factor is "how much $1 at time `t` is worth today" (continuous compounding). `rateAt` is the annual rate at a given tenor; `df` is the factor. This single building block is used by every pricing model in §4.6.
-
-### 4.6 Pricing (`Pricing.scala`)
+### 7.5 `Pricing`
 
 ```scala
 object Pricing {
-  def baseRate(instrument: InstrumentSpec): Double
-  def price(instrument: InstrumentSpec, curveShifts: List[CurveShift], scalar: Map[String, Double]): Double
-  def bondPrice(spec: BondSpec, curve: DiscountCurve): Double
-  def mortgagePrice(spec: MortgageSpec, curve: DiscountCurve, prepayShift: Double): Double
-  def mbsPrice(spec: MbsPoolSpec, curve: DiscountCurve, prepayShift: Double): Double
-  def swapPrice(spec: SwapSpec, curve: DiscountCurve): Double
-  def capPrice(spec: CapSpec, curve: DiscountCurve, volShift: Double): Double
-  def swaptionPrice(spec: SwaptionSpec, curve: DiscountCurve, volShift: Double): Double
-  def fxForwardPrice(spec: FxForwardSpec, curve: DiscountCurve, fxShift: Double): Double
-  def expandPrepayCurve(curve: PrepayCurve, termMonths: Int): Vector[Double]
-  // private: forwardRate, blackCall, blackPut, clamp, amortisingPrice
+  def price(instrument: InstrumentSpec, market: MarketData): Double
+  def bondPrice(spec: BondSpec, curve: Curve): Double
+  def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector): Double
+  def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector): Double
+  def swapPrice(spec: SwapSpec, curve: Curve): Double
+  def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface): Double
+  def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface): Double
+  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote): Double
 }
 ```
 
-`price` is the unified entry point the executor uses: it builds a `DiscountCurve(baseRate(instrument), curveShifts)` and dispatches to the per-instrument function, passing the relevant scalar shift.
+**Bond** — sum of discounted fixed coupons + principal. **Mortgage/MBS** — level-payment amortization: annuity payment `P = N·(r/12)/(1 − (1+r/12)^−n)`, then each month interest + scheduled principal + prepayment (`SMM = 1 − (1−CPR)^(1/12)` applied to the remaining balance), each discounted. **Swap** — `fixedPV − floatPV` with float leg `N·(1 − df(T))`. **Cap** — strip of Black-76 caplets on the forward rate. **Swaption** — Black-76 on the forward swap rate, scaled by the annuity. **FX forward** — covered interest parity `N·(spot·dfForeign − contracted·dfDomestic)`.
 
-Each model, in plain language:
-
-**Bond (`bondPrice`).** A bond pays a fixed *coupon* every `1/freq` years and returns the *notional* (face value) at maturity. Its value is the sum of each cashflow times its discount factor: `PV = Σ CF(t) · df(t)`. "Present value" is today's worth of future cash: money later is worth less than money now, because money now can earn interest.
-
-**Mortgage (`mortgagePrice`) and MBS (`mbsPrice`).** Both call `amortisingPrice`. A mortgage is a loan repaid in equal monthly *annuity payments*; each payment is part interest and part principal. The constant payment that exactly repays `notional` at note rate `r` over `n` months is the **annuity payment**:
-
-```text
-payment = notional · (r/12) / (1 − (1 + r/12)^(−n))
-```
-
-Each month the borrower may also *prepay* (repay principal early). Prepayment speed is the **CPR** (Conditional Prepayment Rate, annualised) converted to **SMM** (Single Monthly Mortality, monthly) via `SMM = 1 − (1 − CPR)^(1/12)`. The prepaid amount is `SMM` applied to the principal remaining after the scheduled payment. Price = sum of monthly cashflows (interest + scheduled principal + prepayment), each discounted. The MBS (mortgage-backed security) uses the pool's weighted-average coupon (`wac`) as the note rate and weighted-average maturity (`wam`) as the term.
-
-**Swap (`swapPrice`).** A swap exchanges a *fixed* leg for a *floating* leg: value = fixed-leg PV − floating-leg PV. The fixed leg is the same as bond coupons at `fixedRate`. The floating leg is `notional · (1 − df(T))` — receiving floating interest and repaying principal at the end is worth `notional − notional·df(T)`. A positive value means the fixed leg is worth more than the floating leg.
-
-**Cap (`capPrice`).** A cap is a strip of **caplets**; each caplet pays when a floating rate exceeds `strike`. Each caplet uses **Black's model (Black-76)** on the forward rate, discounted back: `notional · accrual · blackCall(forward, strike, vol, t) · df(t1)`. Black-76 is the standard log-normal model for interest-rate options. Because a cap pays out, its value rises when volatility rises.
-
-**Swaption (`swaptionPrice`).** An option to enter a swap at a fixed `strike`. It first computes the **forward swap rate** — the fixed rate that makes the swap worth zero today — then prices the option with Black-76 on that rate. A *payer* swaption uses `blackCall`; a *receiver* uses `blackPut`. The payoff is scaled by the **annuity** (the present value of the fixed-leg accruals).
-
-**FX forward (`fxForwardPrice`).** An agreement to exchange currencies at a future date, priced via **covered interest parity**: `notional · (spot·(1+fxShift) · dfForeign − fxRate · dfDomestic)`. Intuition: holding foreign currency earns the foreign rate while the domestic equivalent earns the domestic rate; the forward value is the difference in their discounted values.
-
-**Supporting helpers.** `forwardRate(curve, t0, t1, accrual)` derives the forward rate between two dates from discount factors: `(df(t0)/df(t1) − 1) / accrual`. `blackCall`/`blackPut` implement Black-76 (with `d1`, `d2` and the normal CDF). `expandPrepayCurve` turns a `FlatPrepay`/`RampPrepay` into a per-month `Vector[Double]` of CPR. `clamp` bounds a value to `[min, max]`.
-
-## 5. `com.writhlang.risk` — risk-factor taxonomy
-
-Source: `risk/KeyType.scala`, `risk/RiskFactorKey.scala`, `risk/LegacyRiskFactors.scala`. This package gives risk factors a precise, round-trippable identity; the DSL's five legacy words map onto it.
-
-**`KeyType`** — the taxonomy of *kinds* of market risk (a sealed trait of case objects). Only a few are exercised today (noted in the code); the rest reserve the taxonomy for future asset classes:
+## 8. `com.writhlang.render`
 
 ```scala
-sealed trait KeyType { def name: String }
-object KeyType {
-  case object DiscountCurve; case object IndexCurve; case object YieldCurve
-  case object CreditCurve; case object FxSpot; case object FxVolatility
-  case object CapFloorVolatility; case object SwaptionVolatility
-  case object EquitySpot; case object EquityVolatility; case object DividendYield
-  case object InflationZero; case object InflationYoY
-  case object CommodityCurve; case object CommodityVolatility
-  case object Correlation; case object Prepay; case object Security
-  val all: List[KeyType]; def fromName(name: String): Option[KeyType]
-}
+object DotRenderer { def toDot(dag: Dag): String }
 ```
 
-**`Tenor`** — a time in years, canonical form `5Y`:
+Emits a left-to-right `digraph`, colored by `Op` type and clustered per instrument.
 
-```scala
-final case class Tenor(years: Double) { def canonical: String }
-object Tenor { def renderYears(years: Double): String; /* implicit .Y syntax */ }
-```
-
-**`Strike`** — an option strike coordinate: `ATM` ("at-the-money") or `StrikeValue(rate: Double)`.
-
-**`Dimension`** — typed coordinates of a risk key: `TenorDim`, `ExpiryDim`, `SwapTenorDim`, `StrikeDim`, `LossLevelDim`.
-
-**`RiskFactorKey`** — a fully-addressed risk factor:
-
-```scala
-final case class RiskFactorKey(
-  keyType: KeyType, name: String,
-  tenor: Option[Tenor] = None, expiry: Option[Tenor] = None,
-  swapTenor: Option[Tenor] = None, strike: Option[Strike] = None,
-  lossLevel: Option[Double] = None
-) {
-  def dimensions: Vector[Dimension]
-  def canonical: String   // e.g. "DiscountCurve:EUR:5Y", "SwaptionVolatility:EUR:5Yx10Y:ATM"
-}
-object RiskFactorKey {
-  def renderDecimal(value: Double): String
-  def parse(canonical: String): Either[String, RiskFactorKey]
-}
-```
-
-Two keys are equal iff their `canonical` strings are equal, which is what makes them safe to embed in DAG node ids and use as map keys.
-
-**`LegacyRiskFactors`** maps the five DSL words to fixed keys:
-
-| DSL word | `RiskFactorKey` |
-| -------- | --------------- |
-| `rate` | `DiscountCurve:EUR` |
-| `spread` | `CreditCurve:EUR` |
-| `prepay` | `Prepay:EUR` |
-| `volatility` | `SwaptionVolatility:EUR` |
-| `fx` | `FxSpot:EURUSD` |
-
-It provides `fromWord(word): Option[RiskFactorKey]` and the inverse `wordFor(key): Option[String]`, used by `DslCompiler` to decide which keys a shock touches.
-
-## 6. `com.writhlang.render` — DOT rendering
-
-```scala
-object DotRenderer {
-  def toDot(dag: Dag): String
-}
-```
-
-`toDot` emits a left-to-right Graphviz `digraph`. Edges point from dependencies to dependents. Nodes are colored by `Op` type (shock = yellow, price = blue, delta = green, gamma = teal, cross = purple, linear = grey, quadratic = orange) and grouped into subgraph clusters per instrument, keyed by the instrument id embedded in the node id.
-
-## 7. `com.writhlang.app` — the CLI
+## 9. `com.writhlang.app` — the CLI
 
 ```scala
 object Main extends ZIOAppDefault {
-  val defaultDsl: String            // built-in example program
-  override def run: ZIO[/* ... */, Any, Any]
-  // private: CliConfig (--input/--dot/--png), graphvizAvailable, printResults, loadDsl, format
+  val defaultMarketJson: String; val defaultDsl: String
+  override def run: ZIO[/* … */, Any, Any]
 }
 ```
 
-Flow: read args → load DSL (file or `defaultDsl`) → `Parser.parseProgram` → `DslCompiler.build` → `DotRenderer.toDot` → write DOT (and PNG if Graphviz `dot` is on `PATH`) → `Executor.run` → print per-instrument base price and per-shock `full`/`linear`/`quadratic` prices. CLI flags: `--input <file>`, `--dot <file>`, `--png <file>` (a bare positional is treated as input).
+Flow: read args (`--input`, `--market`, `--dot`, `--png`) → load DSL + market JSON → `MarketDataJson.parse` + `Parser.parseProgram` → `DslCompiler.build` → `DotRenderer.toDot` → write DOT/PNG → `Executor.run` → print per-instrument base price and per-shock `full`/`linear`/`quadratic`.
 
-## 8. Native compiler stub (`compiler`, `interpreter`, `examples`)
-
-A separate, early-stage path that compiles a tiny `let`/`print` language to x86-64 GAS assembly. It is **not** wired into the CLI and has **no tests**; it is kept distinct from the risk DSL:
-
-- `compiler.frontend.Frontend.parse` — parses `let <id> = <int>;` and `print(<id>)`.
-- `compiler.ast.AST` — `IntLiteral`, `Var`, `Let`, `Print`, `Fn`, `Program`.
-- `compiler.ir.IR` — register instructions (`MovRegImm`, `MovRegReg`, `AddRegImm`, `CallPrint`, `Label`) and `Module`.
-- `compiler.backend.gas.GasBackend.emit` — emits a `main:` routine plus a `print_long` libc `printf` helper.
-- `interpreter.Interpreter` — `compileToAssembly(src): Either[CompileError, String]` and a ZIO wrapper `compileToAssemblyZIO`.
-
-## 9. Node-id reference
-
-`DslCompiler` generates deterministic node ids that encode type, instrument, and factor. The canonical factor string may itself contain `:` (e.g. `DiscountCurve:EUR`), so ids are parsed positionally where needed.
+## 10. Node-id reference
 
 | Pattern | Meaning |
-| ------- | ------- |
-| `shock:<name>:<key>` | scalar shock literal (`Const`) |
-| `price:base:<inst>` | unshocked price |
-| `price:bump:<inst>:<key>:<dir>` | one-factor bumped price (`dir` = `up`/`down`) |
+| --- | --- |
+| `shock:<name>:<key>` | shock literal (`Const`) |
+| `price:base:<inst>` | base price |
+| `price:bump:<inst>:<key>:<dir>` | one-factor bumped price |
 | `price:cross:<inst>:<k1>:<k2>` | two-factor bumped price |
 | `greek:delta:<inst>:<key>` / `greek:gamma:<inst>:<key>` | delta / gamma |
 | `greek:cross:<inst>:<k1>:<k2>` | cross-gamma |
-| `price:linear:<inst>:<shock>` / `price:quad:<inst>:<shock>` | linear / quadratic Taylor scenario prices |
-| `price:full:<inst>:<shock>` | exact re-priced scenario value |
+| `price:linear:<inst>:<shock>` / `price:quad:<inst>:<shock>` / `price:full:<inst>:<shock>` | scenario prices |
 
-The execution result `Map[String, Double]` is keyed by these ids; the CLI reads `price:base:<id>`, `price:full:<id>:<shock>`, `price:linear:<id>:<shock>`, and `price:quad:<id>:<shock>` to print results.
+The canonical key may itself contain `:` (e.g. `DiscountCurve:EUR:2Y`), so ids are parsed positionally where needed.
+
+
+

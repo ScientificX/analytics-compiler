@@ -31,6 +31,9 @@ dependencies {
     // FastParse for parsing
     implementation("com.lihaoyi:fastparse_2.13:2.3.3")
 
+    // ujson for the JSON market-data loader
+    implementation("com.lihaoyi:ujson_2.13:1.5.0")
+
     // Logback Classic for logging
     // https://mvnrepository.com/artifact/ch.qos.logback/logback-classic
     implementation("ch.qos.logback:logback-classic:1.5.22")

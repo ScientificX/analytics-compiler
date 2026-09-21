@@ -2,28 +2,40 @@ package com.writhlang.dsl
 
 import fastparse._
 import fastparse.NoWhitespace._
+import com.writhlang.risk.{KeyType, RiskFactorKey, ShiftType, Tenor}
 
 object Parser {
+
   private sealed trait PropValue
   private case class NumberValue(value: Double) extends PropValue
-  private case class PrepayValue(curve: PrepayCurve) extends PropValue
+  private case class RefValue(key: RiskFactorKey) extends PropValue
   private case class FlagValue(value: Boolean) extends PropValue
 
   private case class InstrumentRaw(kind: String, id: String, props: List[(String, PropValue)])
 
-  private sealed trait ShockItem
-  private case class ScalarItem(name: String, value: Double) extends ShockItem
-  private case class CurveItem(shift: CurveShift) extends ShockItem
+  private sealed trait RawNode
+  private case class RawPortfolio(name: String, children: List[RawNode]) extends RawNode
+  private case class RawInstrument(instr: InstrumentRaw) extends RawNode
 
   def parseProgram(input: String): Either[String, Program] =
     fastparse.parse(input, program(_)) match {
-      case Parsed.Success((shocks, rawInstruments), _) =>
-        val instruments = rawInstruments.map(validateInstrument)
-        val errors = instruments.collect { case Left(err) => err }
+      case Parsed.Success((shocks, rawNodes), _) =>
+        val validated = rawNodes.map(validateNode)
+        val errors = validated.collect { case Left(err) => err }
         if (errors.nonEmpty) Left(errors.mkString("; "))
-        else Right(Program(shocks, instruments.collect { case Right(v) => v }))
+        else Right(Program(shocks, validated.collect { case Right(v) => v }))
       case f: Parsed.Failure => Left(f.msg)
     }
+
+  private def validateNode(raw: RawNode): Either[String, PortfolioNode] = raw match {
+    case RawPortfolio(name, children) =>
+      val validated = children.map(validateNode)
+      val errors = validated.collect { case Left(err) => err }
+      if (errors.nonEmpty) Left(errors.mkString("; "))
+      else Right(Portfolio(name, validated.collect { case Right(v) => v }))
+    case RawInstrument(instr) =>
+      validateInstrument(instr).map(spec => InstrumentLeaf(spec))
+  }
 
   private def validateInstrument(raw: InstrumentRaw): Either[String, InstrumentSpec] = {
     val props = raw.props.toMap
@@ -42,14 +54,10 @@ object Parser {
         case Some(_) => Left(s"instrument ${raw.id} property $name must be a number")
       }
 
-    def reqInt(name: String): Either[String, Int] =
-      reqNumber(name).flatMap { v =>
-        if (v % 1.0 == 0.0) Right(v.toInt) else Left(s"instrument ${raw.id} property $name must be an integer")
-      }
-
     def reqPositiveInt(name: String): Either[String, Int] =
-      reqInt(name).flatMap { v =>
-        if (v > 0) Right(v) else Left(s"instrument ${raw.id} property $name must be > 0")
+      reqNumber(name).flatMap { v =>
+        if (v % 1.0 == 0.0 && v > 0.0) Right(v.toInt)
+        else Left(s"instrument ${raw.id} property $name must be a positive integer")
       }
 
     def reqPositiveNumber(name: String): Either[String, Double] =
@@ -66,10 +74,10 @@ object Parser {
         case Some(_) => Left(s"instrument ${raw.id} property $name must be a number")
       }
 
-    def reqPrepay(name: String): Either[String, PrepayCurve] =
+    def reqRef(name: String): Either[String, RiskFactorKey] =
       props.get(name) match {
-        case Some(PrepayValue(curve)) => Right(curve)
-        case Some(_) => Left(s"instrument ${raw.id} property $name must be a prepayCurve")
+        case Some(RefValue(key)) => Right(key)
+        case Some(_) => Left(s"instrument ${raw.id} property $name must be a market-data reference")
         case None => Left(s"instrument ${raw.id} missing property: $name")
       }
 
@@ -80,136 +88,182 @@ object Parser {
         case Some(_) => Left(s"instrument ${raw.id} flag must be call or put")
       }
 
-    def validRamp(curve: PrepayCurve): Either[String, Unit] = curve match {
-      case RampPrepay(_, _, months) if months <= 0 =>
-        Left(s"instrument ${raw.id} prepayCurve ramp months must be > 0")
-      case _ => Right(())
-    }
-
     raw.kind match {
       case "bond" =>
         for {
           notional <- reqNumber("notional")
           coupon <- reqNumber("coupon")
           maturity <- reqPositiveInt("maturity")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
           freq <- optPositiveInt("freq", 1)
-        } yield BondSpec(raw.id, notional, coupon, maturity, rate, spread, freq)
+        } yield BondSpec(raw.id, notional, coupon, maturity, discount, credit, freq)
 
       case "mortgage" =>
         for {
           notional <- reqNumber("notional")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
+          noteRate <- reqNumber("noteRate")
           term <- reqPositiveInt("term")
-          curve <- reqPrepay("prepayCurve")
-          _ <- validRamp(curve)
-        } yield MortgageSpec(raw.id, notional, rate, spread, term, curve)
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
+          prepay <- reqRef("prepayCurve")
+        } yield MortgageSpec(raw.id, notional, noteRate, term, discount, credit, prepay)
 
       case "mbs" =>
         for {
           notional <- reqNumber("notional")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
           wac <- reqNumber("wac")
           wam <- reqPositiveInt("wam")
-          curve <- reqPrepay("prepayCurve")
-          _ <- validRamp(curve)
-        } yield MbsPoolSpec(raw.id, notional, rate, spread, wac, wam, curve)
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
+          prepay <- reqRef("prepayCurve")
+        } yield MbsPoolSpec(raw.id, notional, wac, wam, discount, credit, prepay)
 
       case "swap" =>
         for {
           notional <- reqNumber("notional")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
           fixedRate <- reqNumber("fixedRate")
           maturity <- reqPositiveInt("maturity")
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
           freq <- optPositiveInt("freq", 1)
-        } yield SwapSpec(raw.id, notional, rate, spread, fixedRate, maturity, freq)
+        } yield SwapSpec(raw.id, notional, fixedRate, maturity, discount, credit, freq)
 
       case "cap" =>
         for {
           notional <- reqNumber("notional")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
           strike <- reqNumber("strike")
           maturity <- reqPositiveInt("maturity")
           freq <- optPositiveInt("freq", 4)
-          volatility <- reqNumber("volatility")
-        } yield CapSpec(raw.id, notional, rate, spread, strike, maturity, freq, volatility)
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
+          vol <- reqRef("volSurface")
+        } yield CapSpec(raw.id, notional, strike, maturity, freq, discount, credit, vol)
 
       case "swaption" =>
         for {
           notional <- reqNumber("notional")
-          rate <- reqNumber("rate")
-          spread <- optNumber("spread", 0.0)
           strike <- reqNumber("strike")
           expiry <- reqPositiveNumber("expiry")
           maturity <- reqPositiveInt("maturity")
           freq <- optPositiveInt("freq", 2)
-          volatility <- reqNumber("volatility")
           isPayer <- optFlag(default = true)
-        } yield SwaptionSpec(raw.id, notional, rate, spread, strike, expiry, maturity, freq, volatility, isPayer)
+          discount <- reqRef("discountCurve")
+          credit <- reqRef("creditCurve")
+          vol <- reqRef("volSurface")
+        } yield SwaptionSpec(raw.id, notional, strike, expiry, maturity, freq, isPayer, discount, credit, vol)
 
       case "fxforward" =>
         for {
           notional <- reqNumber("notional")
-          domesticRate <- reqNumber("domesticRate")
           fxRate <- reqNumber("fxRate")
-          foreignRate <- reqNumber("foreignRate")
           maturity <- reqPositiveNumber("maturity")
-        } yield FxForwardSpec(raw.id, notional, domesticRate, fxRate, foreignRate, maturity)
+          domestic <- reqRef("domesticCurve")
+          foreign <- reqRef("foreignCurve")
+          spot <- reqRef("fxSpot")
+        } yield FxForwardSpec(raw.id, notional, fxRate, maturity, domestic, foreign, spot)
 
       case other => Left(s"unknown instrument type: $other")
     }
   }
 
-  private def program[_: P]: P[(List[Shock], List[InstrumentRaw])] = P(
-    ws ~ shocksBlock ~ ws ~ (ws ~ instrumentBlock).rep ~ ws ~ End
-  ).map { case (shocks, instruments) => (shocks, instruments.toList) }
+  private def refKey(field: String, name: String): RiskFactorKey = field match {
+    case "discountCurve" | "domesticCurve" | "foreignCurve" => RiskFactorKey(KeyType.DiscountCurve, name)
+    case "creditCurve" => RiskFactorKey(KeyType.CreditCurve, name)
+    case "prepayCurve" => RiskFactorKey(KeyType.Prepay, name)
+    case "volSurface"  => RiskFactorKey(KeyType.SwaptionVolatility, name)
+    case "fxSpot"      => RiskFactorKey(KeyType.FxSpot, name)
+  }
+
+  // ---- grammar ----
+
+  private def program[_: P]: P[(List[Shock], List[RawNode])] = P(
+    ws ~ shocksBlock.? ~ ws ~ (ws ~ node).rep ~ ws ~ End
+  ).map { case (shocksOpt, nodes) => (shocksOpt.getOrElse(Nil), nodes.toList) }
+
+  private def node[_: P]: P[RawNode] = P(portfolioBlock | instrumentBlock)
+
+  private def portfolioBlock[_: P]: P[RawNode] = P(
+    "portfolio" ~ ws ~ ident ~ ws ~ "{" ~ ws ~ (ws ~ node).rep ~ ws ~ "}"
+  ).map { case (name, children) => RawPortfolio(name, children.toList) }
+
+  private def instrumentBlock[_: P]: P[RawNode] = P(
+    "instrument" ~ ws ~ kind ~ ws ~ ident ~ ws ~ "{" ~ ws ~ prop.rep ~ ws ~ "}"
+  ).map { case (kind, id, props) => RawInstrument(InstrumentRaw(kind, id, props.toList)) }
+
+  private def kind[_: P]: P[String] = P(("bond" | "mortgage" | "mbs" | "swaption" | "swap" | "cap" | "fxforward").!)
 
   private def shocksBlock[_: P]: P[List[Shock]] = P(
-    "shocks" ~ ws ~ "{" ~ ws ~ shockEntry.rep ~ ws ~ "}"
+    "shocks" ~ ws ~ "{" ~ ws ~ (ws ~ shockEntry).rep ~ ws ~ "}"
   ).map(_.toList)
 
   private def shockEntry[_: P]: P[Shock] = P(
-    "shock" ~ ws ~ ident ~ ws ~ "{" ~ ws ~ shockItem.rep ~ ws ~ "}" ~ entryEnd
-  ).map { case (name, items) =>
-    val (scalars, curves) = items.foldLeft((Map.empty[String, Double], List.empty[CurveShift])) {
-      case ((s, c), ScalarItem(k, v)) => (s + (k -> v), c)
-      case ((s, c), CurveItem(cs)) => (s, c :+ cs)
-    }
-    Shock(name, scalars, curves)
+    "shock" ~ ws ~ ident ~ ws ~ "{" ~ ws ~ shockMove.rep ~ ws ~ "}"
+  ).map { case (name, moves) => Shock(name, moves.toList) }
+
+  private def shockMove[_: P]: P[ShockMove] = P((curveMove | scalarMove) ~ entryEnd)
+
+  private def curveMove[_: P]: P[ShockMove] = P(curveKw ~ ws ~ ident ~ ws ~ curveTail).map {
+    case (keyType, name, build) => build(keyType, name)
   }
 
-  private def shockItem[_: P]: P[ShockItem] = P(curveItem | scalarItem)
+  private def curveTail[_: P]: P[(KeyType, String) => ShockMove] = P(curveShapeTail | curvePointTail)
 
-  private def scalarItem[_: P]: P[ShockItem] = P(
-    ident ~ ws ~ number ~ entryEnd
-  ).map { case (name, value) => ScalarItem(name, value) }
+  private def curveShapeTail[_: P]: P[(KeyType, String) => ShockMove] = P(shape).map { s =>
+    (kt: KeyType, name: String) => ShapeMove(RiskFactorKey(kt, name), s)
+  }
 
-  private def curveItem[_: P]: P[ShockItem] = P(
-    "curve" ~ ws ~ curveShift ~ entryEnd
-  ).map(cs => CurveItem(cs))
+  private def curvePointTail[_: P]: P[(KeyType, String) => ShockMove] = P(tenor ~ ws ~ shiftType.? ~ ws ~ number).map {
+    case (t, stOpt, amount) =>
+      (kt: KeyType, name: String) =>
+        PointMove(RiskFactorKey(kt, name, tenor = Some(t)), stOpt.getOrElse(ShiftType.defaultFor(kt)), amount)
+  }
 
-  private def curveShift[_: P]: P[CurveShift] = P(
+  private def scalarMove[_: P]: P[ShockMove] = P(scalarKw ~ ws ~ ident ~ ws ~ shiftType.? ~ ws ~ number).map {
+    case (keyType, name, stOpt, amount) =>
+      PointMove(RiskFactorKey(keyType, name), stOpt.getOrElse(ShiftType.defaultFor(keyType)), amount)
+  }
+
+  private def shape[_: P]: P[CurveShift] = P(
     ("parallel" ~ ws ~ number).map(v => FlatShift(v): CurveShift) |
       ("bucket" ~ ws ~ number ~ ws ~ number).map { case (t, a) => BucketShift(t, a): CurveShift } |
       ("twist" ~ ws ~ number ~ ws ~ number ~ (ws ~ number).?).map {
         case (short, long, pivot) => TwistShift(short, long, pivot.getOrElse(10.0)): CurveShift
+      } |
+      ("sine" ~ ws ~ number ~ ws ~ number ~ (ws ~ number).?).map {
+        case (amp, omega, phase) => SineShift(amp, omega, phase.getOrElse(0.0)): CurveShift
       }
   )
 
-  private def instrumentBlock[_: P]: P[InstrumentRaw] = P(
-    "instrument" ~ ws ~ ("bond" | "mortgage" | "mbs" | "swaption" | "swap" | "cap" | "fxforward").! ~ ws ~ ident ~ ws ~ "{" ~ ws ~ prop.rep ~ ws ~ "}"
-  ).map { case (kind, id, props) => InstrumentRaw(kind, id, props.toList) }
+  private def tenor[_: P]: P[Tenor] = P(number ~ CharIn("YM").!).map { case (v, unit) =>
+    Tenor(if (unit == "M") v / 12.0 else v)
+  }
 
-  private def prop[_: P]: P[(String, PropValue)] = P(prepayProp | flagProp | numberProp)
+  private def shiftType[_: P]: P[ShiftType] = P(("absolute" | "relative").!).map(s => ShiftType.fromName(s).get)
 
-  private def prepayProp[_: P]: P[(String, PropValue)] = P(
-    "prepayCurve" ~ ws ~ prepayCurve ~ entryEnd
-  ).map(curve => ("prepayCurve", PrepayValue(curve)))
+  private def curveKw[_: P]: P[KeyType] = P(("discountcurve" | "creditcurve" | "indexcurve" | "yieldcurve").!).map(curveKeyTypes)
+  private def scalarKw[_: P]: P[KeyType] = P(("fxspot" | "prepay" | "swaptionvol" | "capfloorvol").!).map(scalarKeyTypes)
+
+  private val curveKeyTypes: Map[String, KeyType] = Map(
+    "discountcurve" -> KeyType.DiscountCurve,
+    "creditcurve" -> KeyType.CreditCurve,
+    "indexcurve" -> KeyType.IndexCurve,
+    "yieldcurve" -> KeyType.YieldCurve
+  )
+  private val scalarKeyTypes: Map[String, KeyType] = Map(
+    "fxspot" -> KeyType.FxSpot,
+    "prepay" -> KeyType.Prepay,
+    "swaptionvol" -> KeyType.SwaptionVolatility,
+    "capfloorvol" -> KeyType.CapFloorVolatility
+  )
+
+  // ---- props ----
+
+  private def prop[_: P]: P[(String, PropValue)] = P(refProp | flagProp | numberProp)
+
+  private def refProp[_: P]: P[(String, PropValue)] = P(
+    ("discountCurve" | "creditCurve" | "prepayCurve" | "volSurface" | "domesticCurve" | "foreignCurve" | "fxSpot").! ~ ws ~ ident ~ entryEnd
+  ).map { case (field, name) => (field, RefValue(refKey(field, name))) }
 
   private def flagProp[_: P]: P[(String, PropValue)] = P(
     ("call" | "put").! ~ entryEnd
@@ -219,20 +273,13 @@ object Parser {
     ident ~ ws ~ number ~ entryEnd
   ).map { case (name, value) => (name, NumberValue(value)) }
 
-  private def prepayCurve[_: P]: P[PrepayCurve] = P(
-    ("flat" ~ ws ~ number).map(v => FlatPrepay(v): PrepayCurve) |
-      ("ramp" ~ ws ~ number ~ ws ~ number ~ ws ~ intNumber).map { case (start, end, months) =>
-        RampPrepay(start, end, months): PrepayCurve
-      }
-  )
+  // ---- tokens ----
 
-  private def ident[_: P]: P[String] = P(CharIn("a-zA-Z") ~ CharsWhileIn("a-zA-Z0-9_", 0)).!
+  private def ident[_: P]: P[String] = P(CharIn("a-zA-Z") ~ CharsWhileIn("a-zA-Z0-9_.", 0)).!
 
   private def number[_: P]: P[Double] = P(
     (("-" | "+").? ~ CharsWhileIn("0-9", 1) ~ ("." ~ CharsWhileIn("0-9", 1)).?).!
   ).map(_.toDouble)
-
-  private def intNumber[_: P]: P[Int] = P(CharsWhileIn("0-9", 1).!).map(_.toInt)
 
   private def ws[_: P]: P[Unit] = P(CharsWhileIn(" \r\n\t").rep)
 

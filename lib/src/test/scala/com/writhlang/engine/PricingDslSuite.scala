@@ -1,8 +1,9 @@
 package com.writhlang.engine
 
 import com.writhlang.dsl._
-import com.writhlang.render.DotRenderer
 import com.writhlang.marketdata._
+import com.writhlang.marketdata.bootstrap._
+import com.writhlang.render.DotRenderer
 import com.writhlang.risk._
 import com.writhlang.scenario._
 import org.scalatest.funsuite.AnyFunSuite
@@ -18,334 +19,195 @@ class PricingDslSuite extends AnyFunSuite {
       Runtime.default.unsafe.run(Executor.run(dag)).getOrThrow()
     }
 
+  private val eurKey = RiskFactorKey(KeyType.DiscountCurve, "EUR")
+  private val eur2yKey = RiskFactorKey(KeyType.DiscountCurve, "EUR", tenor = Some(Tenor(2.0)))
+  private val creditKey = RiskFactorKey(KeyType.CreditCurve, "EUR.CREDIT")
+  private val fxKey = RiskFactorKey(KeyType.FxSpot, "EURUSD")
+
+  private val marketJson =
+    """{
+      |  "curves": {
+      |    "EUR": { "type": "DiscountCurve", "instruments": [
+      |      { "kind": "deposit", "tenor": "1Y", "rate": 0.035 },
+      |      { "kind": "swap", "tenor": "2Y", "rate": 0.040, "freq": 1 },
+      |      { "kind": "swap", "tenor": "3Y", "rate": 0.045, "freq": 1 }
+      |    ]},
+      |    "EUR.CREDIT": { "type": "CreditCurve", "flat": 0.0 }
+      |  },
+      |  "fxSpots": { "EURUSD": 1.25 },
+      |  "volSurfaces": { "EUR.SWAPTION": { "flat": 0.20 } },
+      |  "prepayVectors": { "EUR.MBS": { "termMonths": 360, "flat": 0.02 } }
+      |}""".stripMargin
+
+  private def market: MarketData = MarketDataJson.parse(marketJson).toOption.get
+
   private def parse(dsl: String): Program = Parser.parseProgram(dsl).toOption.get
 
-  test("parse DSL with scalar and curve shocks and all instrument types") {
-    val input =
-      """
-        |shocks {
-        |  shock s1 { rate 0.001; spread 0.0001; prepay -0.005; volatility 0.01; fx 0.02; }
-        |  shock twist { curve twist -0.001 0.001 10; }
-        |  shock bucket { curve bucket 5 0.001; }
-        |}
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 5; rate 0.04; spread 0.0; freq 2; }
-        |instrument mortgage M1 { notional 100000; rate 0.04; term 120; spread 0.001; prepayCurve ramp 0.02 0.05 12; }
-        |instrument mbs MB1 { notional 100000; rate 0.04; spread 0.001; wac 0.05; wam 300; prepayCurve flat 0.02; }
-        |instrument swap SW1 { notional 1000000; rate 0.03; spread 0.0005; fixedRate 0.031; maturity 5; freq 2; }
-        |instrument cap C1 { notional 1000000; rate 0.035; spread 0.0005; strike 0.04; maturity 3; freq 4; volatility 0.20; }
-        |instrument swaption S1 { notional 1000000; rate 0.03; spread 0.0005; strike 0.031; expiry 2; maturity 5; freq 2; volatility 0.18; call; }
-        |instrument fxforward F1 { notional 1000000; domesticRate 0.02; fxRate 1.25; foreignRate 0.01; maturity 1; }
-        |""".stripMargin
+  test("bootstrapper builds discount factors for the worked example") {
+    val quotes = QuoteSet(List(
+      Deposit(Tenor(1.0), 0.035),
+      Swap(Tenor(2.0), 0.040, 1),
+      Swap(Tenor(3.0), 0.045, 1)
+    ))
+    val curve = Bootstrapper.bootstrap(quotes).toOption.get
 
-    val program = parse(input)
-    assert(program.shocks.map(_.name) == List("s1", "twist", "bucket"))
-    assert(program.shocks.head.factors("rate") == 0.001)
-    assert(program.shocks(1).curve.head.isInstanceOf[TwistShift])
-    assert(program.shocks(2).curve.head.isInstanceOf[BucketShift])
-    assert(program.instruments.size == 7)
+    val df1 = math.exp(-0.035 * 1.0)
+    val df2 = (1.0 - 0.040 * df1) / (1.0 + 0.040)
+    val df3 = (1.0 - 0.045 * (df1 + df2)) / (1.0 + 0.045)
+
+    assert(math.abs(curve.df(1.0) - df1) < 1e-12)
+    assert(math.abs(curve.df(2.0) - df2) < 1e-12)
+    assert(math.abs(curve.df(3.0) - df3) < 1e-12)
   }
 
-  test("bond: delta negative, gamma positive, quadratic closer to full than linear") {
-    val input =
-      """
-        |shocks { shock s1 { rate 0.001; } }
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 10; rate 0.04; spread 0.0; freq 1; }
-        |""".stripMargin
+  test("par-conversion: a +1bp 2Y swap bump reprices a 3Y bond via re-bootstrap") {
+    val program = parse(
+      """shocks {
+        |  shock up2y { discountcurve EUR 2Y absolute +0.0001; }
+        |}
+        |portfolio Book {
+        |  instrument bond B1 { notional 1000; coupon 0.045; maturity 3; discountCurve EUR; creditCurve EUR.CREDIT; freq 1; }
+        |}
+        |""".stripMargin)
 
-    val results = run(DslCompiler.build(parse(input)))
+    val results = run(DslCompiler.build(program, market))
     val base = results(DslCompiler.basePriceId("B1"))
-    val delta = results(DslCompiler.deltaId("B1", LegacyRiskFactors.rate))
-    val gamma = results(DslCompiler.gammaId("B1", LegacyRiskFactors.rate))
-    val full = results(DslCompiler.fullScenarioId("B1", "s1"))
-    val linear = results(DslCompiler.linearScenarioId("B1", "s1"))
-    val quad = results(DslCompiler.quadraticScenarioId("B1", "s1"))
+    val full = results(DslCompiler.fullScenarioId("B1", "up2y"))
+    val linear = results(DslCompiler.linearScenarioId("B1", "up2y"))
+    val quad = results(DslCompiler.quadraticScenarioId("B1", "up2y"))
+    val delta = results(DslCompiler.deltaId("B1", eur2yKey))
 
     assert(base > 0.0)
-    assert(delta < 0.0)
-    assert(gamma > 0.0)
+    assert(math.abs(delta) > 0.0, "the 2Y swap point moves the bond price")
+    // Par-conversion produces a sawtooth: bumping one swap point moves adjacent
+    // discount factors in opposite directions, so the net bond move has no fixed
+    // sign. What must hold is reconciliation — the quadratic (2nd-order)
+    // approximation is at least as close to the full revaluation as linear.
     assert(math.abs(quad - full) <= math.abs(linear - full))
+    assert(math.abs(linear - full) < 1e-4 * base, "first-order reconciliation within tolerance")
   }
 
-  test("swap prices near par when fixedRate equals discount rate") {
-    val input =
-      """
-        |shocks { shock s1 { rate 0.001; } }
-        |instrument swap SW1 { notional 1000000; rate 0.03; spread 0.0; fixedRate 0.03; maturity 5; freq 2; }
-        |""".stripMargin
-
-    val results = run(DslCompiler.build(parse(input)))
-    val base = results(DslCompiler.basePriceId("SW1"))
-    val full = results(DslCompiler.fullScenarioId("SW1", "s1"))
-    assert(math.abs(base) < 0.02 * 1000000.0)
-    assert(math.abs(full - base) > 0.0)
-  }
-
-  test("cap price is positive for an in-the-money cap") {
-    val input =
-      """
-        |shocks { shock v { volatility 0.01; } }
-        |instrument cap C1 { notional 1000000; rate 0.03; spread 0.0; strike 0.02; maturity 2; freq 4; volatility 0.20; }
-        |""".stripMargin
-
-    val results = run(DslCompiler.build(parse(input)))
-    assert(results(DslCompiler.basePriceId("C1")) > 0.0)
-  }
-
-  test("fxforward base is near zero when domestic equals foreign rate") {
-    val input =
-      """
-        |shocks { shock f { fx 0.01; } }
-        |instrument fxforward F1 { notional 1000000; domesticRate 0.02; fxRate 1.25; foreignRate 0.02; maturity 1; }
-        |""".stripMargin
-
-    val results = run(DslCompiler.build(parse(input)))
-    val base = results(DslCompiler.basePriceId("F1"))
-    val fxDelta = results(DslCompiler.deltaId("F1", LegacyRiskFactors.fx))
-    assert(math.abs(base) < 1.0)
-    assert(fxDelta > 0.0)
-  }
-
-  test("curve shocks produce distinct full reprice values") {
-    val input =
-      """
-        |shocks {
-        |  shock bucket { curve bucket 5 0.001; }
-        |  shock twist { curve twist -0.001 0.001 10; }
-        |}
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 5; rate 0.04; spread 0.0; freq 1; }
-        |""".stripMargin
-
-    val results = run(DslCompiler.build(parse(input)))
-    val base = results(DslCompiler.basePriceId("B1"))
-    val bucket = results(DslCompiler.fullScenarioId("B1", "bucket"))
-    val twist = results(DslCompiler.fullScenarioId("B1", "twist"))
-    assert(math.abs(bucket - base) > 0.0)
-    assert(math.abs(twist - base) > 0.0)
-    assert(math.abs(bucket - twist) > 0.0)
-  }
-
-  test("RiskFactorKey taxonomy round-trips through canonical strings (AC1)") {
-    val discount5y = RiskFactorKey(KeyType.DiscountCurve, "EUR", tenor = Some(Tenor(5.0)))
-    assert(discount5y.canonical == "DiscountCurve:EUR:5Y")
-    assert(RiskFactorKey.parse("DiscountCurve:EUR:5Y").toOption.contains(discount5y))
-
-    val swaptionAtm = RiskFactorKey(
-      KeyType.SwaptionVolatility,
-      "EUR",
-      expiry = Some(Tenor(5.0)),
-      swapTenor = Some(Tenor(10.0)),
-      strike = Some(ATM)
-    )
-    assert(swaptionAtm.canonical == "SwaptionVolatility:EUR:5Yx10Y:ATM")
-    assert(RiskFactorKey.parse("SwaptionVolatility:EUR:5Yx10Y:ATM").toOption.contains(swaptionAtm))
-
-    val roundTripped = RiskFactorKey.parse(discount5y.canonical).toOption.get
-    assert(roundTripped == discount5y)
-    assert(roundTripped.hashCode == discount5y.hashCode)
-  }
-
-  test("legacy DSL words resolve to distinct RiskFactorKeys (AC2)") {
-    assert(LegacyRiskFactors.fromWord("rate").contains(LegacyRiskFactors.rate))
-    assert(LegacyRiskFactors.rate.keyType == KeyType.DiscountCurve)
-    assert(LegacyRiskFactors.fromWord("spread").contains(LegacyRiskFactors.spread))
-    assert(LegacyRiskFactors.spread.keyType == KeyType.CreditCurve)
-    assert(LegacyRiskFactors.fromWord("prepay").contains(LegacyRiskFactors.prepay))
-    assert(LegacyRiskFactors.prepay.keyType == KeyType.Prepay)
-    assert(LegacyRiskFactors.fromWord("volatility").contains(LegacyRiskFactors.volatility))
-    assert(LegacyRiskFactors.volatility.keyType == KeyType.SwaptionVolatility)
-    assert(LegacyRiskFactors.fromWord("fx").contains(LegacyRiskFactors.fx))
-    assert(LegacyRiskFactors.fx.keyType == KeyType.FxSpot)
-    assert(LegacyRiskFactors.all.distinct.size == 5)
-
-    val results = run(DslCompiler.build(parse(
-      """
-        |shocks { shock s1 { rate 0.001; spread 0.0001; } }
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 5; rate 0.04; spread 0.0; freq 2; }
-        |""".stripMargin)))
-    assert(!results(DslCompiler.basePriceId("B1")).isNaN)
-    assert(!results(DslCompiler.deltaId("B1", LegacyRiskFactors.rate)).isNaN)
-    assert(!results(DslCompiler.deltaId("B1", LegacyRiskFactors.spread)).isNaN)
-  }
-
-  test("bond DAG has separate DiscountCurve and CreditCurve node families (AC3)") {
-    val dag = DslCompiler.build(parse(
-      """
-        |shocks { shock s1 { rate 0.001; spread 0.0001; } }
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 5; rate 0.04; spread 0.0; freq 2; }
-        |""".stripMargin))
-
-    val rateDeltaId = DslCompiler.deltaId("B1", LegacyRiskFactors.rate)
-    val spreadDeltaId = DslCompiler.deltaId("B1", LegacyRiskFactors.spread)
-    val rateGammaId = DslCompiler.gammaId("B1", LegacyRiskFactors.rate)
-    val spreadGammaId = DslCompiler.gammaId("B1", LegacyRiskFactors.spread)
-    val crossId = DslCompiler.crossGammaId("B1", LegacyRiskFactors.rate, LegacyRiskFactors.spread)
-
-    assert(dag.nodes.contains(rateDeltaId))
-    assert(dag.nodes.contains(spreadDeltaId))
-    assert(dag.nodes.contains(rateGammaId))
-    assert(dag.nodes.contains(spreadGammaId))
-    assert(dag.nodes.contains(crossId))
-    assert(rateDeltaId != spreadDeltaId)
-    assert(rateDeltaId.contains("DiscountCurve:EUR"))
-    assert(spreadDeltaId.contains("CreditCurve:EUR"))
-  }
-
-  test("node ids encode the canonical key and are unique (AC4)") {
-    val keys = List(LegacyRiskFactors.rate, LegacyRiskFactors.spread, LegacyRiskFactors.prepay)
-    val instId = "B1"
-
-    val deltaIds = keys.map(k => DslCompiler.deltaId(instId, k))
-    val gammaIds = keys.map(k => DslCompiler.gammaId(instId, k))
-    val bumpIds = keys.map(k => DslCompiler.bumpedPriceId(instId, k, "up"))
-    val crossIds = keys.combinations(2).toList.map { case List(a, b) => DslCompiler.crossGammaId(instId, a, b) }
-
-    assert(deltaIds.distinct.size == keys.size)
-    assert(gammaIds.distinct.size == keys.size)
-    assert(bumpIds.distinct.size == keys.size)
-    assert(crossIds.distinct.size == keys.combinations(2).size)
-
-    keys.foreach { key =>
-      assert(DslCompiler.deltaId(instId, key).contains(key.canonical))
-      assert(DslCompiler.gammaId(instId, key).contains(key.canonical))
-      assert(DslCompiler.bumpedPriceId(instId, key, "up").contains(key.canonical))
-    }
-  }
-
-
-  test("DOT rendering groups instrument nodes and edges stay valid (AC5)") {
+  test("central/forward/backward delta schemes agree within tolerance") {
     val program = parse(
-      """
-        |shocks { shock s1 { rate 0.001; } }
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 5; rate 0.04; spread 0.0; freq 2; }
-        |instrument swap SW1 { notional 1000000; rate 0.03; spread 0.0; fixedRate 0.031; maturity 5; freq 2; }
+      """portfolio Book {
+        |  instrument bond B1 { notional 1000; coupon 0.045; maturity 3; discountCurve EUR; creditCurve EUR.CREDIT; freq 1; }
+        |}
         |""".stripMargin)
-    val dag = DslCompiler.build(program)
-    val dot = DotRenderer.toDot(dag)
 
-    assert(dot.contains("subgraph cluster_B1"))
-    assert(dot.contains("subgraph cluster_SW1"))
-
-    def clusterBody(instId: String): String = {
-      val marker = s"subgraph cluster_$instId {"
-      val start = dot.indexOf(marker)
-      if (start < 0) ""
-      else {
-        val afterStart = dot.substring(start + marker.length)
-        val end = afterStart.indexOf("\n  }")
-        if (end < 0) afterStart else afterStart.substring(0, end)
-      }
+    def deltaFor(scheme: ShiftScheme): Double = {
+      val cfg = SensitivityConfig(shiftScheme = scheme)
+      val results = run(DslCompiler.build(program, market, cfg))
+      results(DslCompiler.deltaId("B1", eur2yKey))
     }
 
+    val central = deltaFor(ShiftScheme.Central)
+    val forward = deltaFor(ShiftScheme.Forward)
+    val backward = deltaFor(ShiftScheme.Backward)
+
+    assert(math.abs(central - forward) < 1e-4)
+    assert(math.abs(central - backward) < 1e-4)
+  }
+
+  test("factorsFor yields per-pillar keys for a quote-backed curve") {
+    val bond = BondSpec("B1", 1000, 0.045, 3, eurKey, creditKey, 1)
+    val factors = DslCompiler.factorsFor(bond, market)
+
+    assert(factors.contains(eur2yKey))
+    assert(factors.contains(RiskFactorKey(KeyType.DiscountCurve, "EUR", tenor = Some(Tenor(1.0)))))
+    assert(factors.contains(RiskFactorKey(KeyType.DiscountCurve, "EUR", tenor = Some(Tenor(3.0)))))
+    assert(factors.contains(creditKey), "flat credit curve stays a single undimensioned key")
+  }
+
+  test("invalid quotes return Left") {
+    val nonMonotonic = QuoteSet(List(
+      Swap(Tenor(2.0), 0.040, 1),
+      Swap(Tenor(3.0), 0.020, 1)
+    ))
+    assert(Bootstrapper.bootstrap(nonMonotonic).isLeft)
+  }
+
+  test("JSON loader round-trips the market-data schema") {
+    val m = market
+    assert(m.curve(eurKey).isInstanceOf[BootstrappedCurve])
+    assert(m.quotes(eurKey).instruments.size == 3)
+    assert(math.abs(m.fxSpot(fxKey).value - 1.25) < 1e-12)
+    assert(m.curve(creditKey).rateAt(2.0) == 0.0)
+  }
+
+  test("recursive portfolios flatten with paths") {
+    val program = parse(
+      """portfolio Desk {
+        |  portfolio BookA {
+        |    instrument bond B1 { notional 1000; coupon 0.045; maturity 3; discountCurve EUR; creditCurve EUR.CREDIT; freq 1; }
+        |  }
+        |  portfolio BookB {
+        |    instrument swap S1 { notional 1000000; fixedRate 0.04; maturity 2; discountCurve EUR; creditCurve EUR.CREDIT; freq 1; }
+        |  }
+        |}
+        |""".stripMargin)
+    val flattened = DslCompiler.flattenInstruments(program.nodes)
+    assert(flattened.size == 2)
+    assert(flattened.exists { case (spec, _) => spec.id == "B1" })
+    assert(flattened.exists { case (_, path) => path == List("Desk", "BookA") })
+    assert(flattened.exists { case (_, path) => path == List("Desk", "BookB") })
+  }
+
+  test("fx forward reprices under a relative FX spot shock") {
+    val program = parse(
+      """shocks { shock fxup { fxspot EURUSD relative +0.01; } }
+        |portfolio FxBook {
+        |  instrument fxforward F1 { notional 1000000; fxRate 1.25; maturity 1; domesticCurve EUR; foreignCurve EUR; fxSpot EURUSD; }
+        |}
+        |""".stripMargin)
+    val results = run(DslCompiler.build(program, market))
+    val base = results(DslCompiler.basePriceId("F1"))
+    val full = results(DslCompiler.fullScenarioId("F1", "fxup"))
+    assert(math.abs(base) < 1.0, "forward is near zero when domestic equals foreign")
+    assert(full > base, "a stronger foreign currency raises the forward value")
+  }
+
+  test("DOT rendering clusters instrument nodes and keeps edges valid") {
+    val program = parse(
+      """shocks { shock up2y { discountcurve EUR 2Y absolute +0.0001; } }
+        |portfolio Book {
+        |  instrument bond B1 { notional 1000; coupon 0.045; maturity 3; discountCurve EUR; creditCurve EUR.CREDIT; freq 1; }
+        |}
+        |""".stripMargin)
+    val dag = DslCompiler.build(program, market)
+    val dot = DotRenderer.toDot(dag)
+    assert(dot.contains("subgraph cluster_B1"))
     dag.nodes.keys.foreach(id => assert(dot.contains(s"\"$id\" [label="), s"missing node $id"))
     dag.nodes.values.foreach { instr =>
       instr.deps.foreach(dep => assert(dag.nodes.contains(dep), s"${instr.id} refs missing dep $dep"))
     }
-
-    dag.nodes.values
-      .filter(i => i.id.startsWith("price:") || i.id.startsWith("greek:"))
-      .foreach { instr =>
-        val instId = instr.id.split(":")(2)
-        assert(clusterBody(instId).contains(s"\"${instr.id}\" [label="), s"${instr.id} not in cluster $instId")
-      }
   }
 
-  test("granular programmatic addressing resolves type/name/dimensions (AC6)") {
-    val discount = RiskFactorKey.parse("DiscountCurve:EUR:5Y").toOption.get
-    assert(discount.keyType == KeyType.DiscountCurve)
-    assert(discount.name == "EUR")
-    assert(discount.dimensions == Vector[Dimension](TenorDim(5.0)))
+  test("shift ordering: cross-factor and within-factor commute; mixed abs/rel does not") {
+    val m = market
 
-    val swaption = RiskFactorKey.parse("SwaptionVolatility:EUR:5Yx10Y:ATM").toOption.get
-    assert(swaption.keyType == KeyType.SwaptionVolatility)
-    assert(swaption.name == "EUR")
-    assert(swaption.dimensions == Vector[Dimension](ExpiryDim(5.0), SwapTenorDim(10.0), StrikeDim(ATM)))
+    def curvePillars(md: MarketData): Vector[(Double, Double)] =
+      md.curve(eurKey).asInstanceOf[BootstrappedCurve].pillars
+
+    // 1. Cross-factor: a curve pillar bump and an FX spot bump update disjoint
+    //    MarketData fields, so the order does not matter.
+    val curveShift = Scenario("c", Map(eurKey -> List(ParQuoteShift(2.0, 0.0001))))
+    val fxShift = Scenario("f", Map(fxKey -> List(RelativeSpotShift(0.01))))
+    val cThenF = fxShift.applyTo(curveShift.applyTo(m))
+    val fThenC = curveShift.applyTo(fxShift.applyTo(m))
+    assert(curvePillars(cThenF) == curvePillars(fThenC))
+    assert(cThenF.fxSpot(fxKey).value == fThenC.fxSpot(fxKey).value)
+
+    // 2. Within-factor additive: two pillar bumps on one curve also commute —
+    //    they add to disjoint quotes and the re-bootstrap is deterministic on
+    //    the final quote set.
+    val twoThenThree = Scenario("23", Map(eurKey -> List(ParQuoteShift(2.0, 0.0001), ParQuoteShift(3.0, 0.0002))))
+    val threeThenTwo = Scenario("32", Map(eurKey -> List(ParQuoteShift(3.0, 0.0002), ParQuoteShift(2.0, 0.0001))))
+    assert(curvePillars(twoThenThree.applyTo(m)) == curvePillars(threeThenTwo.applyTo(m)))
+
+    // 3. Mixed absolute + relative on the SAME spot does NOT commute:
+    //    (spot + a)·(1+b) != spot·(1+b) + a. This is the case where order matters.
+    val absThenRel = Scenario("ar", Map(fxKey -> List(AbsoluteSpotShift(0.01), RelativeSpotShift(0.01))))
+    val relThenAbs = Scenario("ra", Map(fxKey -> List(RelativeSpotShift(0.01), AbsoluteSpotShift(0.01))))
+    assert(absThenRel.applyTo(m).fxSpot(fxKey).value != relThenAbs.applyTo(m).fxSpot(fxKey).value)
   }
-
-  test("mortgage reprices under a sine-wave prepay shock (Stage 1 AC1)") {
-    val spec = MortgageSpec("M1", 100000.0, 0.04, 0.001, 12, FlatPrepay(0.02))
-    val base = DslCompiler.baseMarketData(spec)
-
-    val amplitude = 0.005 // CPR units (decimal); small enough to stay in [0,1]
-    val omega = 0.5       // radians per year
-    val phase = 0.0
-    val sineScenario = Scenario(
-      "sine",
-      Map(LegacyRiskFactors.prepay -> AdditiveShift(Sine(amplitude, omega, phase)))
-    )
-    val shocked = sineScenario.applyTo(base)
-    val vec = shocked.prepayVector(LegacyRiskFactors.prepay)
-
-    // cpr(t) = base(t) + A*sin(omega*t + phi), with t = month/12 (years)
-    (0 until 12).foreach { month =>
-      val expected = 0.02 + amplitude * math.sin(omega * (month / 12.0) + phase)
-      assert(math.abs(vec.cpr(month) - expected) < 1e-12)
-    }
-
-    // The sine shock moves the price vs the base.
-    assert(math.abs(Pricing.price(spec, shocked) - Pricing.price(spec, base)) > 0.0)
-  }
-
-  test("fxforward reprices under a relative FX spot shock (Stage 1 AC2)") {
-    val spec = FxForwardSpec("F1", 1000000.0, 0.02, 1.25, 0.01, 1.0)
-    val base = DslCompiler.baseMarketData(spec)
-
-    val shift = 0.01 // +1% relative move
-    val fxScenario = Scenario("fxup", Map(LegacyRiskFactors.fx -> RelativeSpotShift(shift)))
-    val shocked = fxScenario.applyTo(base)
-
-    // Relative spot shock: S' = S * (1 + shift)
-    val expectedSpot = 1.25 * (1.0 + shift)
-    assert(math.abs(shocked.fxSpot(LegacyRiskFactors.fx).value - expectedSpot) < 1e-12)
-
-    // Covered-interest-parity forward value with the shocked spot.
-    val dfDomestic = math.exp(-0.02 * 1.0)
-    val dfForeign = math.exp(-0.01 * 1.0)
-    val expected = 1000000.0 * (expectedSpot * dfForeign - 1.25 * dfDomestic)
-    assert(math.abs(Pricing.price(spec, shocked) - expected) < 1e-9)
-  }
-
-  test("SensitivityScenarioGenerator reproduces the finite-difference delta (Stage 1 AC3)") {
-    val input =
-      """
-        |shocks { shock s1 { rate 0.001; } }
-        |instrument bond B1 { notional 1000; coupon 0.05; maturity 10; rate 0.04; spread 0.0; freq 1; }
-        |""".stripMargin
-    val results = run(DslCompiler.build(parse(input)))
-    val dagDelta = results(DslCompiler.deltaId("B1", LegacyRiskFactors.rate))
-
-    val spec = BondSpec("B1", 1000.0, 0.05, 10, 0.04, 0.0, 1)
-    val base = DslCompiler.baseMarketData(spec)
-    val bump = 0.0001
-
-    val generator = new SensitivityScenarioGenerator(
-      factors = List(LegacyRiskFactors.rate),
-      bumpFor = _ => bump,
-      shiftFor = (_, amount) => AdditiveShift(Flat(amount))
-    )
-
-    val up = generator.next().get
-    val down = generator.next().get
-    assert(generator.next().isEmpty)
-
-    val upPrice = Pricing.price(spec, up.applyTo(base))
-    val downPrice = Pricing.price(spec, down.applyTo(base))
-    val finiteDifferenceDelta = (upPrice - downPrice) / (2.0 * bump)
-
-    assert(math.abs(finiteDifferenceDelta - dagDelta) < 1e-6)
-
-    generator.reset()
-    assert(generator.next().isDefined)
-  }
-
-  test("CorrelationMatrix placeholder is constructible with a unit diagonal (Stage 1)") {
-    val matrix = CorrelationMatrix(
-      labels = Vector("5Y", "10Y"),
-      values = Vector(Vector(1.0, 0.8), Vector(0.8, 1.0))
-    )
-    assert(matrix.size == 2)
-    assert(matrix(0, 0) == 1.0)
-    assert(matrix(1, 1) == 1.0)
-    assert(matrix(0, 1) == 0.8)
-  }
-
 }

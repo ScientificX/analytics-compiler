@@ -2,65 +2,52 @@ package com.writhlang.engine
 
 import com.writhlang.dsl._
 import com.writhlang.marketdata._
-import com.writhlang.risk._
 import org.apache.commons.math3.distribution.NormalDistribution
 
 /**
   * Closed-form pricing for the seven DSL instruments, consuming market-data
-  * OBJECTS (curve, vol surface, prepay vector, FX spot) rather than scalar
-  * shock parameters. Shocks are applied upstream by transforming the
-  * [[com.writhlang.marketdata.MarketData]] snapshot (see `scenario.Scenario`);
-  * nothing here knows about a "shock" — it just prices what it is given.
+  * OBJECTS (curves, vol surface, prepay vector, FX spot) resolved from the
+  * instrument spec's risk-factor-key references. Nothing here knows about a
+  * "shock" — it prices what it is given.
   */
 object Pricing {
-  // Shared standard-normal CDF for Black pricing. (Known, pre-existing: this
-  // singleton is not thread-safe; see plan.md risks. Left as-is for Stage 1.)
   private val normal = new NormalDistribution()
 
-  /**
-    * Unified pricing entry point used by the executor. Resolves the market-data
-    * objects each instrument needs from the snapshot, keyed by the legacy DSL
-    * factor keys (the Stage 0 compatibility boundary), then delegates to the
-    * typed per-instrument functions.
-    */
+  /** Unified pricing entry point used by the executor. */
   def price(instrument: InstrumentSpec, market: MarketData): Double = instrument match {
     case s: BondSpec =>
-      bondPrice(s, market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread))
+      bondPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve))
     case s: MortgageSpec =>
       mortgagePrice(
         s,
-        market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread),
-        market.prepayVector(LegacyRiskFactors.prepay)
+        market.combinedCurve(s.discountCurve, s.creditCurve),
+        market.prepayVector(s.prepayCurve)
       )
     case s: MbsPoolSpec =>
       mbsPrice(
         s,
-        market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread),
-        market.prepayVector(LegacyRiskFactors.prepay)
+        market.combinedCurve(s.discountCurve, s.creditCurve),
+        market.prepayVector(s.prepayCurve)
       )
     case s: SwapSpec =>
-      swapPrice(s, market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread))
+      swapPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve))
     case s: CapSpec =>
       capPrice(
         s,
-        market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread),
-        market.volSurface(LegacyRiskFactors.volatility)
+        market.combinedCurve(s.discountCurve, s.creditCurve),
+        market.volSurface(s.volSurface)
       )
     case s: SwaptionSpec =>
       swaptionPrice(
         s,
-        market.combinedCurve(LegacyRiskFactors.rate, LegacyRiskFactors.spread),
-        market.volSurface(LegacyRiskFactors.volatility)
+        market.combinedCurve(s.discountCurve, s.creditCurve),
+        market.volSurface(s.volSurface)
       )
     case s: FxForwardSpec =>
-      fxForwardPrice(s, market.curve(LegacyRiskFactors.rate), market.fxSpot(LegacyRiskFactors.fx))
+      fxForwardPrice(s, market.curve(s.domesticCurve), market.curve(s.foreignCurve), market.fxSpot(s.fxSpot))
   }
 
-  /**
-    * Fixed-rate bullet bond: sum of discounted coupons plus the final principal.
-    * Each coupon is `notional * couponRate / freq`; the final cashflow adds the
-    * notional. Discounted on the supplied (discount + spread) curve.
-    */
+  /** Fixed-rate bullet bond: sum of discounted coupons plus the final principal. */
   def bondPrice(spec: BondSpec, curve: Curve): Double = {
     val periods = spec.maturityYears * spec.couponFreq
     val accrual = 1.0 / spec.couponFreq
@@ -73,16 +60,15 @@ object Pricing {
   }
 
   def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector): Double =
-    amortisingPrice(spec.notional, spec.rate, spec.termMonths, prepay, curve)
+    amortisingPrice(spec.notional, spec.noteRate, spec.termMonths, prepay, curve)
 
   def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector): Double =
     amortisingPrice(spec.notional, spec.wac, spec.wamMonths, prepay, curve)
 
   /**
     * Level-payment amortising loan (mortgage/MBS): a constant annuity payment is
-    * split into interest and scheduled principal each month; prepayment (from the
-    * prepay vector) retires additional principal. Cashflows are discounted on the
-    * supplied curve.
+    * split into interest and scheduled principal each month; prepayment retires
+    * additional principal. Cashflows are discounted on the supplied curve.
     */
   private def amortisingPrice(
     notional: Double,
@@ -104,8 +90,7 @@ object Pricing {
     while (month <= termMonths && balance > 0.0) {
       val interest = balance * noteRateMonthly
       val scheduledPrincipal = payment - interest
-      // CPR -> SMM (Single Monthly Mortality): SMM = 1 - (1 - CPR)^(1/12),
-      // the monthly prepayment speed equivalent to the annualised CPR.
+      // CPR -> SMM (Single Monthly Mortality): SMM = 1 - (1 - CPR)^(1/12).
       val cpr = clamp(prepay.cpr(month - 1), 0.0, 1.0) // 0..1 decimal, not %
       val smm = 1.0 - math.pow(1.0 - cpr, 1.0 / 12.0)
       // Prepayment = SMM applied to the principal remaining after scheduled amortisation.
@@ -119,10 +104,7 @@ object Pricing {
     pv
   }
 
-  /**
-    * Interest-rate swap: fixed-leg PV minus floating-leg PV. The floating leg is
-    * priced from the discount curve as N * (1 - df(T)).
-    */
+  /** Interest-rate swap: fixed-leg PV minus floating-leg PV. */
   def swapPrice(spec: SwapSpec, curve: Curve): Double = {
     val periods = spec.maturityYears * spec.freq
     val accrual = 1.0 / spec.freq
@@ -132,12 +114,7 @@ object Pricing {
     fixedPV - floatPV
   }
 
-  /**
-    * Interest-rate cap: a strip of caplets, each paying when the forward rate
-    * exceeds the strike. Each caplet is priced with the Black (Black-76) model,
-    * using the forward rate over the caplet's accrual period and the vol surface
-    * at that caplet's start (expiry) time.
-    */
+  /** Interest-rate cap: a strip of caplets priced with Black (Black-76). */
   def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface): Double = {
     val periods = spec.maturityYears * spec.freq
     val accrual = 1.0 / spec.freq
@@ -152,10 +129,7 @@ object Pricing {
     }.sum
   }
 
-  /**
-    * Swaption: an option to enter a swap. Priced with the Black (Black-76) model
-    * on the forward swap rate; `call` = payer swaption, `put` = receiver swaption.
-    */
+  /** Swaption: an option to enter a swap, priced with Black (Black-76). */
   def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface): Double = {
     val vol = math.max(volSurface.volatility(spec.expiryYears, spec.strike), 0.0)
     val t = spec.expiryYears
@@ -179,14 +153,13 @@ object Pricing {
   }
 
   /**
-    * FX forward, priced by covered interest parity: value = notional *
-    * (spot * dfForeign - contractedRate * dfDomestic). The spot is the (possibly
-    * shocked) FX spot; the contracted rate and foreign rate are instrument terms.
+    * FX forward, priced by covered interest parity:
+    * `notional · (spot · dfForeign - contractedRate · dfDomestic)`.
     */
-  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, fx: SpotQuote): Double = {
+  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote): Double = {
     val t = spec.maturityYears
     val dfDomestic = domestic.df(t)
-    val dfForeign = math.exp(-spec.foreignRate * t)
+    val dfForeign = foreign.df(t)
     val spotFx = fx.value
     spec.notional * (spotFx * dfForeign - spec.fxRate * dfDomestic)
   }
@@ -217,5 +190,3 @@ object Pricing {
   private def clamp(value: Double, min: Double, max: Double): Double =
     math.max(min, math.min(max, value))
 }
-
-

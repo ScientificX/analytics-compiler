@@ -49,7 +49,7 @@ object DotRenderer {
 
   private def nodeLabel(instr: Instruction): (String, String) = instr.op match {
     case Const(_) => (s"${instr.id}\\nshock", "#fbbc04")
-    case Price(_, _, _) => (s"${instr.id}\\nprice", "#a7c7e7")
+    case Price(_, _) => (s"${instr.id}\\nprice", "#a7c7e7")
     case Delta(_, _, _, _) => (s"${instr.id}\\ndelta", "#c8e6c9")
     case Gamma(_, _, _, _) => (s"${instr.id}\\ngamma", "#b2dfdb")
     case CrossGamma(_, _, _, _, _, _) => (s"${instr.id}\\ncross", "#b39ddb")

@@ -31,8 +31,8 @@ object Executor {
 
     instr.op match {
       case Const(v) => Right(v)
-      case Price(instrument, curveShifts, scalar) =>
-        Right(Pricing.price(instrument, curveShifts, scalar))
+      case Price(instrument, market) =>
+        Right(Pricing.price(instrument, market))
       case Delta(baseId, upId, downId, bump) =>
         for {
           base <- req(baseId)

@@ -2,7 +2,9 @@ package com.writhlang.engine
 
 import com.writhlang.dsl._
 import com.writhlang.render.DotRenderer
+import com.writhlang.marketdata._
 import com.writhlang.risk._
+import com.writhlang.scenario._
 import org.scalatest.funsuite.AnyFunSuite
 import org.junit.runner.RunWith
 import org.scalatestplus.junit.JUnitRunner
@@ -257,6 +259,93 @@ class PricingDslSuite extends AnyFunSuite {
     assert(swaption.keyType == KeyType.SwaptionVolatility)
     assert(swaption.name == "EUR")
     assert(swaption.dimensions == Vector[Dimension](ExpiryDim(5.0), SwapTenorDim(10.0), StrikeDim(ATM)))
+  }
+
+  test("mortgage reprices under a sine-wave prepay shock (Stage 1 AC1)") {
+    val spec = MortgageSpec("M1", 100000.0, 0.04, 0.001, 12, FlatPrepay(0.02))
+    val base = DslCompiler.baseMarketData(spec)
+
+    val amplitude = 0.005 // CPR units (decimal); small enough to stay in [0,1]
+    val omega = 0.5       // radians per year
+    val phase = 0.0
+    val sineScenario = Scenario(
+      "sine",
+      Map(LegacyRiskFactors.prepay -> AdditiveShift(Sine(amplitude, omega, phase)))
+    )
+    val shocked = sineScenario.applyTo(base)
+    val vec = shocked.prepayVector(LegacyRiskFactors.prepay)
+
+    // cpr(t) = base(t) + A*sin(omega*t + phi), with t = month/12 (years)
+    (0 until 12).foreach { month =>
+      val expected = 0.02 + amplitude * math.sin(omega * (month / 12.0) + phase)
+      assert(math.abs(vec.cpr(month) - expected) < 1e-12)
+    }
+
+    // The sine shock moves the price vs the base.
+    assert(math.abs(Pricing.price(spec, shocked) - Pricing.price(spec, base)) > 0.0)
+  }
+
+  test("fxforward reprices under a relative FX spot shock (Stage 1 AC2)") {
+    val spec = FxForwardSpec("F1", 1000000.0, 0.02, 1.25, 0.01, 1.0)
+    val base = DslCompiler.baseMarketData(spec)
+
+    val shift = 0.01 // +1% relative move
+    val fxScenario = Scenario("fxup", Map(LegacyRiskFactors.fx -> RelativeSpotShift(shift)))
+    val shocked = fxScenario.applyTo(base)
+
+    // Relative spot shock: S' = S * (1 + shift)
+    val expectedSpot = 1.25 * (1.0 + shift)
+    assert(math.abs(shocked.fxSpot(LegacyRiskFactors.fx).value - expectedSpot) < 1e-12)
+
+    // Covered-interest-parity forward value with the shocked spot.
+    val dfDomestic = math.exp(-0.02 * 1.0)
+    val dfForeign = math.exp(-0.01 * 1.0)
+    val expected = 1000000.0 * (expectedSpot * dfForeign - 1.25 * dfDomestic)
+    assert(math.abs(Pricing.price(spec, shocked) - expected) < 1e-9)
+  }
+
+  test("SensitivityScenarioGenerator reproduces the finite-difference delta (Stage 1 AC3)") {
+    val input =
+      """
+        |shocks { shock s1 { rate 0.001; } }
+        |instrument bond B1 { notional 1000; coupon 0.05; maturity 10; rate 0.04; spread 0.0; freq 1; }
+        |""".stripMargin
+    val results = run(DslCompiler.build(parse(input)))
+    val dagDelta = results(DslCompiler.deltaId("B1", LegacyRiskFactors.rate))
+
+    val spec = BondSpec("B1", 1000.0, 0.05, 10, 0.04, 0.0, 1)
+    val base = DslCompiler.baseMarketData(spec)
+    val bump = 0.0001
+
+    val generator = new SensitivityScenarioGenerator(
+      factors = List(LegacyRiskFactors.rate),
+      bumpFor = _ => bump,
+      shiftFor = (_, amount) => AdditiveShift(Flat(amount))
+    )
+
+    val up = generator.next().get
+    val down = generator.next().get
+    assert(generator.next().isEmpty)
+
+    val upPrice = Pricing.price(spec, up.applyTo(base))
+    val downPrice = Pricing.price(spec, down.applyTo(base))
+    val finiteDifferenceDelta = (upPrice - downPrice) / (2.0 * bump)
+
+    assert(math.abs(finiteDifferenceDelta - dagDelta) < 1e-6)
+
+    generator.reset()
+    assert(generator.next().isDefined)
+  }
+
+  test("CorrelationMatrix placeholder is constructible with a unit diagonal (Stage 1)") {
+    val matrix = CorrelationMatrix(
+      labels = Vector("5Y", "10Y"),
+      values = Vector(Vector(1.0, 0.8), Vector(0.8, 1.0))
+    )
+    assert(matrix.size == 2)
+    assert(matrix(0, 0) == 1.0)
+    assert(matrix(1, 1) == 1.0)
+    assert(matrix(0, 1) == 0.8)
   }
 
 }

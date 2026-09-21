@@ -42,8 +42,10 @@ There are **two independent compiler systems** in the codebase, and it is import
 | `engine`     | `DslCompiler.scala`  | Translates `Program` into a `Dag` of computations. |
 |              | `Instruction.scala`, `Dag.scala` | Computation-node and graph model. |
 |              | `Executor.scala`     | ZIO-based topological execution. |
-|              | `Pricing.scala`, `Curve.scala` | Pricing math and discount curve. |
-| `risk`       | `KeyType.scala`, `RiskFactorKey.scala`, `LegacyRiskFactors.scala` | Risk-factor taxonomy, canonical keys, legacy DSL-word mapping. |
+|              | `Pricing.scala`     | Closed-form pricing consuming market-data objects. |
+| `risk`       | `KeyType.scala`, `RiskFactorKey.scala`, `LegacyRiskFactors.scala` | Risk-factor key taxonomy. |
+| `marketdata` | `Curve.scala`, `VolSurface.scala`, `PrepayVector.scala`, `SpotQuote.scala`, `CorrelationMatrix.scala`, `MarketData.scala` | Market-data object types + snapshot. |
+| `scenario`   | `ShiftShape.scala`, `Scenario.scala`, `ScenarioGenerator.scala` | Shock shapes and scenario transformations. |
 | `render`     | `DotRenderer.scala`  | Graphviz DOT emission. |
 | `compiler`   | `Compiler.scala` + subpackages | Native x86-64 GAS backend (stub). |
 | `interpreter`| `Interpreter.scala`  | Thin wrapper around `Compiler`. |
@@ -78,7 +80,7 @@ case class Instruction(id: String, op: Op, deps: List[String])
 | Op | Meaning | Dependencies |
 | -- | ------- | ------------ |
 | `Const(v)` | Literal shock value. | none (leaf) |
-| `Price(instrument, curveShifts, scalar)` | Re-price an instrument under a market state. | none (leaf) |
+| `Price(instrument, market)` | Re-price an instrument under a market-data snapshot. | none (leaf) |
 | `Delta(base, up, down, bump)` | `(up − down) / (2·bump)`. | base, up, down |
 | `Gamma(base, up, down, bump)` | `(up − 2·base + down) / bump²`. | base, up, down |
 | `CrossGamma(base, upI, upJ, upIJ, bI, bJ)` | `(upIJ − upI − upJ + base) / (bI·bJ)`. | base, upI, upJ, upIJ |
@@ -123,7 +125,7 @@ Risk factors per instrument are defined in `DslCompiler.factorsFor`:
 
 ## 6. Pricing model notes
 
-All prices are closed-form present values under a flat discount curve (`DiscountCurve`) built from a base rate plus tenor shifts.
+All prices are closed-form present values. Each instrument consumes a market-data snapshot (`MarketData`) of keyed objects — curves, a vol surface, a prepay vector, and an FX spot — and a shock is a transformation of that snapshot (see `com.writhlang.scenario.Scenario`), never a scalar inside `Pricing`.
 
 | Instrument | Model |
 | ---------- | ----- |
@@ -134,7 +136,7 @@ All prices are closed-form present values under a flat discount curve (`Discount
 | `swaption` | Black's formula on the forward swap rate (payer or receiver). |
 | `fxforward` | Covered-interest-parity forward value. |
 
-`Curve.shiftAt` evaluates a single `CurveShift` at a tenor; `DiscountCurve.rateAt` sums all shifts over the base flat rate, and `df` computes `exp(−rate·t)`.
+`marketdata.Curve.rateAt`/`df` evaluate a zero rate and its discount factor; `scenario.ShiftShape` (`Flat`, `Bucket`, `Twist`, `Sine`, `Custom`) describes an additive shock shape applied to a market object.
 
 Risk sensitivities are **finite differences** with fixed bumps (e.g., rate/spread `1e-4`, prepay `1e-2`, volatility `1e-3`, fx `1e-3`) defined at the top of `DslCompiler`.
 
@@ -160,3 +162,5 @@ A separate, early-stage path under `com.writhlang.compiler` compiles a tiny `let
 - **Parsing/validation** — `Parser.parseProgram` returns `Either[String, Program]` with validation messages.
 - **Execution** — `Executor.run` returns `IO[ExecutionError, Map[String, Double]]`; `ExecutionError` covers missing dependencies (`MissingDependency`) and graph-level failures (`GraphError`, e.g., a cycle).
 - **CLI** — `Main` maps parse and execution failures to human-readable `println` messages.
+
+

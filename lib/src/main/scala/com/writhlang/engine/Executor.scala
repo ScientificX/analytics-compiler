@@ -33,12 +33,22 @@ object Executor {
       case Const(v) => Right(v)
       case Price(instrument, market) =>
         Right(Pricing.price(instrument, market))
-      case Delta(baseId, upId, downId, bump) =>
+      case DeltaCentral(baseId, upId, downId, bump) =>
         for {
           base <- req(baseId)
           up <- req(upId)
           down <- req(downId)
         } yield (up - down) / (2.0 * bump)
+      case DeltaForward(baseId, upId, bump) =>
+        for {
+          base <- req(baseId)
+          up <- req(upId)
+        } yield (up - base) / bump
+      case DeltaBackward(baseId, downId, bump) =>
+        for {
+          base <- req(baseId)
+          down <- req(downId)
+        } yield (base - down) / bump
       case Gamma(baseId, upId, downId, bump) =>
         for {
           base <- req(baseId)

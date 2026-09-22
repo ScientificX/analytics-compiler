@@ -1,5 +1,6 @@
 package com.writhlang.marketdata
 
+import com.writhlang.marketdata.bootstrap.QuoteSet
 import com.writhlang.risk.RiskFactorKey
 
 /**
@@ -7,18 +8,24 @@ import com.writhlang.risk.RiskFactorKey
   * each addressed by a [[RiskFactorKey]]. The key's `KeyType` determines which
   * collection holds the object (curve vs surface vs vector vs spot vs matrix).
   *
-  * This is the "market input object" that Stage 1 introduces. A scenario is a
-  * transformation of this snapshot (see `com.writhlang.scenario.Scenario`); the
-  * snapshot itself is immutable and updated via the `with*` copy methods.
+  * For curves there are two related maps:
+  *   - `curveQuotes` — the *input*: the par instruments whose quotes the curve
+  *     is bootstrapped from. This is what a shock transforms (par-conversion).
+  *   - `curves` — the *derived* result: the bootstrapped (or flat) curve.
+  *
+  * A scenario is a transformation of this snapshot; the snapshot is immutable
+  * and updated via the `with*` copy methods.
   */
 final case class MarketData(
   curves: Map[RiskFactorKey, Curve] = Map.empty,
+  curveQuotes: Map[RiskFactorKey, QuoteSet] = Map.empty,
   volSurfaces: Map[RiskFactorKey, VolSurface] = Map.empty,
   prepayVectors: Map[RiskFactorKey, PrepayVector] = Map.empty,
   fxSpots: Map[RiskFactorKey, SpotQuote] = Map.empty,
   correlations: Map[RiskFactorKey, CorrelationMatrix] = Map.empty
 ) {
   def curve(key: RiskFactorKey): Curve = curves(key)
+  def quotes(key: RiskFactorKey): QuoteSet = curveQuotes(key)
   def volSurface(key: RiskFactorKey): VolSurface = volSurfaces(key)
   def prepayVector(key: RiskFactorKey): PrepayVector = prepayVectors(key)
   def fxSpot(key: RiskFactorKey): SpotQuote = fxSpots(key)
@@ -41,4 +48,8 @@ final case class MarketData(
     copy(fxSpots = fxSpots.updated(key, value))
   def withCorrelation(key: RiskFactorKey, value: CorrelationMatrix): MarketData =
     copy(correlations = correlations.updated(key, value))
+
+  /** Store both a bootstrapped curve and the quotes it was built from. */
+  def withCurveAndQuotes(key: RiskFactorKey, value: Curve, quotes: QuoteSet): MarketData =
+    copy(curves = curves.updated(key, value), curveQuotes = curveQuotes.updated(key, quotes))
 }

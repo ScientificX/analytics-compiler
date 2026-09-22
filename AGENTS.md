@@ -12,11 +12,14 @@ The docs under `docs/` are part of the codebase and must stay in sync with the c
 
 **After each pass — a stage, a feature, or any change that alters behaviour — do a full rewrite of the affected docs, not incremental edits.** Re-read the code and write each doc as a complete, current description end-to-end. A partial edit leaves stale sections that mislead the next reader; if the code changed shape (public API, grammar, package layout, or pricing), the corresponding doc must be rewritten wholesale so every section matches reality.
 
+Each stage (see `plan.md`) also gets a **decisions & discussion log** under `docs/decisions/` (one file per stage, e.g. `stage-2-curve-bootstrapping.md`). It records the *why* — the decisions, rationale, questions raised, and any mid-implementation corrections. Write it as part of the stage and keep it current as the stage is refined; it carries the narrative the reference docs do not.
+
 | Doc | Update it when you… |
 | --- | ------------------- |
 | `docs/architecture.md` | Change module/package layout, the parse → DAG → execute → render pipeline, DAG construction, pricing models, error handling, or the native-compiler stub. |
 | `docs/low-level-design.md` | Change any component's public API, input/output shapes (AST case classes, `Op` variants, `Instruction`/`Dag`, node-id patterns, `RiskFactorKey`), or a pricing formula. |
 | `docs/dsl-reference.md` | Change the DSL grammar, instrument/field names, defaults, or validation rules. |
+| `docs/decisions/<stage>.md` | Finish (or materially change) a stage; record decisions, rationale, and corrections. |
 
 When you add or change a public finance API, explain it in plain language for a software engineer with no finance background, and keep the finance glossary below consistent with any new terms you introduce.
 

@@ -210,4 +210,33 @@ class PricingDslSuite extends AnyFunSuite {
     val relThenAbs = Scenario("ra", Map(fxKey -> List(RelativeSpotShift(0.01), AbsoluteSpotShift(0.01))))
     assert(absThenRel.applyTo(m).fxSpot(fxKey).value != relThenAbs.applyTo(m).fxSpot(fxKey).value)
   }
+
+  test("a 2Y bond has zero sensitivity to a curve point beyond its maturity") {
+    val md = MarketDataJson.parse(
+      """{"curves": {
+        |  "EUR": { "type": "DiscountCurve", "instruments": [
+        |    {"kind":"deposit","tenor":"1Y","rate":0.035},
+        |    {"kind":"swap","tenor":"2Y","rate":0.040,"freq":1},
+        |    {"kind":"swap","tenor":"5Y","rate":0.050,"freq":1}
+        |  ]},
+        |  "EUR.CREDIT": { "type": "CreditCurve", "flat": 0.0 }
+        |}}""".stripMargin).toOption.get
+
+    val bond = BondSpec("B2", 1000, 0.04, 2, eurKey, creditKey, 1)
+    val bump = 0.0001
+
+    def deltaAt(tenor: Double): Double = {
+      val up = Scenario("up", Map(eurKey -> List(ParQuoteShift(tenor, bump)))).applyTo(md)
+      val down = Scenario("dn", Map(eurKey -> List(ParQuoteShift(tenor, -bump)))).applyTo(md)
+      (Pricing.price(bond, up) - Pricing.price(bond, down)) / (2.0 * bump)
+    }
+
+    val base = Pricing.price(bond, md)
+    val delta2y = deltaAt(2.0)
+    val delta5y = deltaAt(5.0)
+
+    assert(math.abs(base - 1000.0) < 1e-6, s"2Y 4% bond should price at par, got $base")
+    assert(delta5y == 0.0, s"expected zero 5Y delta for a 2Y bond, got $delta5y")
+    assert(delta2y != 0.0, s"expected non-zero 2Y delta, got $delta2y")
+  }
 }

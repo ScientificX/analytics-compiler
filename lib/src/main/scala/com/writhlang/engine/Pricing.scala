@@ -13,57 +13,78 @@ import org.apache.commons.math3.distribution.NormalDistribution
 object Pricing {
   private val normal = new NormalDistribution()
 
-  /** Unified pricing entry point used by the executor. */
-  def price(instrument: InstrumentSpec, market: MarketData): Double = instrument match {
+  /**
+    * Unified pricing entry point used by the executor. `elapsedYears` is the time
+    * already passed (in years) since the valuation date; every time-to-cashflow
+    * tenor is shortened by it. This is the Stage 3 "instrument rolls down"
+    * mechanism: re-value the aged instrument against the frozen market (theta).
+    */
+  def price(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double = 0.0): Double = instrument match {
     case s: BondSpec =>
-      bondPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve))
+      bondPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve), elapsedYears)
     case s: MortgageSpec =>
       mortgagePrice(
         s,
         market.combinedCurve(s.discountCurve, s.creditCurve),
-        market.prepayVector(s.prepayCurve)
+        market.prepayVector(s.prepayCurve),
+        elapsedYears
       )
     case s: MbsPoolSpec =>
       mbsPrice(
         s,
         market.combinedCurve(s.discountCurve, s.creditCurve),
-        market.prepayVector(s.prepayCurve)
+        market.prepayVector(s.prepayCurve),
+        elapsedYears
       )
     case s: SwapSpec =>
-      swapPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve))
+      swapPrice(s, market.combinedCurve(s.discountCurve, s.creditCurve), elapsedYears)
     case s: CapSpec =>
       capPrice(
         s,
         market.combinedCurve(s.discountCurve, s.creditCurve),
-        market.volSurface(s.volSurface)
+        market.volSurface(s.volSurface),
+        elapsedYears
       )
     case s: SwaptionSpec =>
       swaptionPrice(
         s,
         market.combinedCurve(s.discountCurve, s.creditCurve),
-        market.volSurface(s.volSurface)
+        market.volSurface(s.volSurface),
+        elapsedYears
       )
     case s: FxForwardSpec =>
-      fxForwardPrice(s, market.curve(s.domesticCurve), market.curve(s.foreignCurve), market.fxSpot(s.fxSpot))
+      fxForwardPrice(s, market.curve(s.domesticCurve), market.curve(s.foreignCurve), market.fxSpot(s.fxSpot), elapsedYears)
+  }
+
+  /**
+    * Cash carry over the holding period: the coupon a fixed-rate bond accrues in
+    * `elapsedYears`. Stage 3 keeps this minimal — options and FX forwards have no
+    * coupon accrual (so they are 0), and swap/mortgage accrual plus financing cost
+    * are deferred. `market` is unused now but reserved for those later cases.
+    */
+  def carry(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double): Double = instrument match {
+    case s: BondSpec => s.notional * s.coupon * elapsedYears
+    case _           => 0.0
   }
 
   /** Fixed-rate bullet bond: sum of discounted coupons plus the final principal. */
-  def bondPrice(spec: BondSpec, curve: Curve): Double = {
+  def bondPrice(spec: BondSpec, curve: Curve, elapsedYears: Double = 0.0): Double = {
     val periods = spec.maturityYears * spec.couponFreq
     val accrual = 1.0 / spec.couponFreq
     val couponCash = spec.notional * spec.coupon * accrual
     (1 to periods).map { i =>
-      val t = i * accrual
+      // Time-to-cashflow, shortened by the time already passed (theta aging).
+      val t = math.max(0.0, i * accrual - elapsedYears)
       val cf = if (i == periods) couponCash + spec.notional else couponCash
       cf * curve.df(t)
     }.sum
   }
 
-  def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector): Double =
-    amortisingPrice(spec.notional, spec.noteRate, spec.termMonths, prepay, curve)
+  def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector, elapsedYears: Double = 0.0): Double =
+    amortisingPrice(spec.notional, spec.noteRate, spec.termMonths, prepay, curve, elapsedYears)
 
-  def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector): Double =
-    amortisingPrice(spec.notional, spec.wac, spec.wamMonths, prepay, curve)
+  def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector, elapsedYears: Double = 0.0): Double =
+    amortisingPrice(spec.notional, spec.wac, spec.wamMonths, prepay, curve, elapsedYears)
 
   /**
     * Level-payment amortising loan (mortgage/MBS): a constant annuity payment is
@@ -75,7 +96,8 @@ object Pricing {
     noteRate: Double,
     termMonths: Int,
     prepay: PrepayVector,
-    curve: Curve
+    curve: Curve,
+    elapsedYears: Double = 0.0
   ): Double = {
     val noteRateMonthly = noteRate / 12.0
     // Annuity payment: P = N * r / (1 - (1+r)^-n), the constant monthly payment
@@ -97,7 +119,7 @@ object Pricing {
       val prepayment = (balance - scheduledPrincipal) * smm
       val totalPrincipal = scheduledPrincipal + prepayment
       val cashflow = interest + totalPrincipal
-      pv += cashflow * curve.df(month / 12.0)
+      pv += cashflow * curve.df(math.max(0.0, month / 12.0 - elapsedYears))
       balance -= totalPrincipal
       month += 1
     }
@@ -105,23 +127,23 @@ object Pricing {
   }
 
   /** Interest-rate swap: fixed-leg PV minus floating-leg PV. */
-  def swapPrice(spec: SwapSpec, curve: Curve): Double = {
+  def swapPrice(spec: SwapSpec, curve: Curve, elapsedYears: Double = 0.0): Double = {
     val periods = spec.maturityYears * spec.freq
     val accrual = 1.0 / spec.freq
     val fixedCash = spec.notional * spec.fixedRate * accrual
-    val fixedPV = (1 to periods).map { i => fixedCash * curve.df(i * accrual) }.sum
-    val floatPV = spec.notional * (1.0 - curve.df(spec.maturityYears.toDouble))
+    val fixedPV = (1 to periods).map { i => fixedCash * curve.df(math.max(0.0, i * accrual - elapsedYears)) }.sum
+    val floatPV = spec.notional * (1.0 - curve.df(math.max(0.0, spec.maturityYears.toDouble - elapsedYears)))
     fixedPV - floatPV
   }
 
   /** Interest-rate cap: a strip of caplets priced with Black (Black-76). */
-  def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface): Double = {
+  def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface, elapsedYears: Double = 0.0): Double = {
     val periods = spec.maturityYears * spec.freq
     val accrual = 1.0 / spec.freq
     val strike = spec.strike
     (1 to periods).map { i =>
-      val t0 = (i - 1) * accrual
-      val t1 = i * accrual
+      val t0 = math.max(0.0, (i - 1) * accrual - elapsedYears)
+      val t1 = math.max(0.0, i * accrual - elapsedYears)
       val forward = forwardRate(curve, t0, t1, accrual)
       val vol = math.max(volSurface.volatility(t0, strike), 0.0)
       val black = blackCall(forward, strike, vol, math.max(t0, 1e-9))
@@ -130,9 +152,9 @@ object Pricing {
   }
 
   /** Swaption: an option to enter a swap, priced with Black (Black-76). */
-  def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface): Double = {
-    val vol = math.max(volSurface.volatility(spec.expiryYears, spec.strike), 0.0)
-    val t = spec.expiryYears
+  def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface, elapsedYears: Double = 0.0): Double = {
+    val t = math.max(0.0, spec.expiryYears - elapsedYears)
+    val vol = math.max(volSurface.volatility(t, spec.strike), 0.0)
     val accrual = 1.0 / spec.freq
     val start = t
     val periods = spec.swapMaturityYears * spec.freq
@@ -156,8 +178,8 @@ object Pricing {
     * FX forward, priced by covered interest parity:
     * `notional · (spot · dfForeign - contractedRate · dfDomestic)`.
     */
-  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote): Double = {
-    val t = spec.maturityYears
+  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote, elapsedYears: Double = 0.0): Double = {
+    val t = math.max(0.0, spec.maturityYears - elapsedYears)
     val dfDomestic = domestic.df(t)
     val dfForeign = foreign.df(t)
     val spotFx = fx.value

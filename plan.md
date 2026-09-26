@@ -161,6 +161,8 @@ all agree to within tolerance of a full revaluation.
 
 ## Stage 3 — Dated market data, theta & carry
 
+**Status: DONE** ✅ (implemented: `MarketData.asOf` dated snapshot + JSON `"asOf"`; new `com.writhlang.time` package — `DayCount` (`Actual365Fixed`/`Actual360`/`Thirty360`), `BusinessDayConvention`, `WeekendCalendar`, `ThetaPeriod`; `Pricing.price(..., elapsedYears)` (the "instrument rolls down" theta mechanism) + `Pricing.carry` (bond coupon accrual); `Theta`/`Carry` `Op` nodes; `SensitivityConfig.thetaPeriod`/`dayCount`/`calendar`; CLI `--theta-days` + theta/carry output; `TimeDimensionSuite`. The fine `rolldown = theta − pure time decay` split is deferred to Stage 6.)
+
 **Goal:** add the time dimension so we can separate "the market moved" from "time passed."
 
 **What changes:**
@@ -168,8 +170,9 @@ all agree to within tolerance of a full revaluation.
 - Add day-count and calendar support (QuantLib-style `ActualActual`, `Actual360`, business-day
   conventions) — or a minimal subset sufficient for the instruments in scope.
 - Add **theta**: value change holding the market fixed while advancing the valuation date.
-- Add **carry/rolldown**: price change from rolling down the curve over the holding period.
-- Extend the scenario model with a `ThetaScenario` (a `Period` shift of the asof date).
+- Add **carry**: the cash accrual (bond coupon) over the holding period. The finer
+  "rolldown vs. pure time decay" split of theta is deferred to Stage 6.
+- Extend the sensitivity config with a `thetaPeriod` (`ThetaPeriod`, a business-day shift of the asof date).
 
 **PLA/explain capability unlocked:** a day-over-day explain can now split "time passed"
 (theta/carry) from "market moved" — without this, all time decay shows up as unexplained
@@ -237,11 +240,20 @@ a funding-spread move produces an attributable FVA P&L, each reconciling with fu
   ```
   TotalP&L = P&L(new trades) + P&L(cancelled) + P&L(amended)
            + Σᵢ δᵢ·Δfᵢ + ½ Σᵢ γᵢ·Δfᵢ² + Σᵢⱼ crossᵢⱼ·ΔfᵢΔfⱼ   (market, RTPL)
-           + theta/carry
+           + theta/carry   (time passed)
            + XVA P&L
            + cash-flow / lifecycle P&L
            + unexplained (residual)
   ```
+- Split the `theta/carry` time bucket into its constituents — the "curve rolls down"
+  vs. "instrument rolls down" distinction (see `docs/decisions/stage-3-dated-market-data-theta-carry.md`):
+  - `carry` (cash) = accrued coupon/interest − financing;
+  - `theta` (price) = curve-frozen, instrument-aged revaluation — already contains rolldown;
+  - `pure time decay` (price) = the same revaluation but each cashflow discounted at its
+    *original* tenor (the "curve rolls down" case);
+  - `rolldown` = `theta − pure time decay` = the curve-slope contribution.
+  Stage 3 ships `theta` + `carry` only; the `rolldown` vs. `pure time decay` fine split is
+  produced here so the identity reconciles bucket-by-bucket.
 - Reuse the existing DAG machinery (`DslCompiler`/`Executor`) as the **risk-theoretical P&L
   (RTPL)** calculator: base → delta/gamma/cross → Taylor terms — now driven by Stages 0–5.
 - Add the **hypothetical P&L (HPL)** path: full revaluation with frozen positions under the

@@ -92,7 +92,22 @@ object DslCompiler {
       buildScenarioNodes(instrument, shock, baseId, factors, market)
     }
 
-    (baseId -> base) :: greekNodes ++ crossNodes ++ scenarioNodes
+    // Time dimension (Stage 3): theta (time decay) = aged revaluation − base, plus the
+    // cash carry accrued over the same period. Only emitted when a theta horizon is set.
+    val timeNodes = config.thetaPeriod match {
+      case Some(period) =>
+        val elapsedYears = period.elapsedYears(market.asOf, config.calendar, config.dayCount)
+        val thetaEvalNodeId = thetaEvalPriceId(instrument.id)
+        val thetaEval = Instruction(thetaEvalNodeId, Price(instrument, market, elapsedYears), Nil)
+        val thetaNodeId = thetaId(instrument.id)
+        val theta = Instruction(thetaNodeId, Theta(baseId, thetaEvalNodeId), List(baseId, thetaEvalNodeId))
+        val carryNodeId = carryId(instrument.id)
+        val carry = Instruction(carryNodeId, Carry(instrument, market, elapsedYears), Nil)
+        List(thetaEvalNodeId -> thetaEval, thetaNodeId -> theta, carryNodeId -> carry)
+      case None => Nil
+    }
+
+    (baseId -> base) :: greekNodes ++ crossNodes ++ scenarioNodes ++ timeNodes
   }
 
   private def buildScenarioNodes(
@@ -223,5 +238,8 @@ object DslCompiler {
   def linearScenarioId(instId: String, shockName: String): String = s"price:linear:$instId:$shockName"
   def quadraticScenarioId(instId: String, shockName: String): String = s"price:quad:$instId:$shockName"
   def fullScenarioId(instId: String, shockName: String): String = s"price:full:$instId:$shockName"
+  def thetaEvalPriceId(instId: String): String = s"price:thetaeval:$instId"
+  def thetaId(instId: String): String = s"price:theta:$instId"
+  def carryId(instId: String): String = s"price:carry:$instId"
 }
 

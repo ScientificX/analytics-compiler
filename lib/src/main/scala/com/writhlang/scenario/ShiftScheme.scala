@@ -1,6 +1,7 @@
 package com.writhlang.scenario
 
 import com.writhlang.risk.{KeyType, RiskFactorKey}
+import com.writhlang.time.{Calendar, DayCount, ThetaPeriod}
 
 /**
   * The finite-difference scheme used to estimate a first-order sensitivity
@@ -33,7 +34,10 @@ object ShiftScheme {
   */
 final case class SensitivityConfig(
   shiftScheme: ShiftScheme = ShiftScheme.Central,
-  bumpFor: RiskFactorKey => Double = SensitivityConfig.defaultBump
+  bumpFor: RiskFactorKey => Double = SensitivityConfig.defaultBump,
+  thetaPeriod: Option[ThetaPeriod] = Some(ThetaPeriod(days = 1)),
+  dayCount: DayCount = DayCount.Actual365Fixed,
+  calendar: Calendar = Calendar.weekend
 )
 
 object SensitivityConfig {

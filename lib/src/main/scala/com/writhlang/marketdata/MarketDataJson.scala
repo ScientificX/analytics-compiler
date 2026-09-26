@@ -3,6 +3,8 @@ package com.writhlang.marketdata
 import com.writhlang.marketdata.bootstrap._
 import com.writhlang.risk._
 
+import java.time.LocalDate
+
 /**
   * Loads a [[MarketData]] snapshot from JSON. The schema declares named market
   * objects, each resolving to a [[RiskFactorKey]]:
@@ -24,6 +26,14 @@ object MarketDataJson {
 
       var market = MarketData()
       val errors = scala.collection.mutable.ListBuffer.empty[String]
+
+      // A dated snapshot: the valuation date. Omitted -> the deterministic default.
+      obj.get("asOf").foreach { asOfValue =>
+        parseAsOf(asOfValue.str) match {
+          case Right(date) => market = market.withAsOf(date)
+          case Left(err)   => errors += err
+        }
+      }
 
       obj.get("curves").foreach { curves =>
         curves.obj.foreach { case (name, value) =>
@@ -61,6 +71,10 @@ object MarketDataJson {
       case e: Exception => Left(s"invalid market-data JSON: ${e.getMessage}")
     }
   }
+
+  private def parseAsOf(value: String): Either[String, LocalDate] =
+    try Right(LocalDate.parse(value))
+    catch { case e: Exception => Left(s"invalid asOf date '$value': ${e.getMessage}") }
 
   private def parseCurve(name: String, value: ujson.Value): Either[String, (RiskFactorKey, Curve, Option[QuoteSet])] = {
     val typeName = value("type").str

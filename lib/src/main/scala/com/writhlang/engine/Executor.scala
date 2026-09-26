@@ -31,8 +31,15 @@ object Executor {
 
     instr.op match {
       case Const(v) => Right(v)
-      case Price(instrument, market) =>
-        Right(Pricing.price(instrument, market))
+      case Price(instrument, market, elapsedYears) =>
+        Right(Pricing.price(instrument, market, elapsedYears))
+      case Theta(baseId, thetaEvalId) =>
+        for {
+          base <- req(baseId)
+          thetaEval <- req(thetaEvalId)
+        } yield thetaEval - base
+      case Carry(instrument, market, elapsedYears) =>
+        Right(Pricing.carry(instrument, market, elapsedYears))
       case DeltaCentral(baseId, upId, downId, bump) =>
         for {
           base <- req(baseId)

@@ -4,6 +4,8 @@ import com.writhlang.dsl.Parser
 import com.writhlang.engine.{DslCompiler, Executor}
 import com.writhlang.marketdata.MarketDataJson
 import com.writhlang.render.DotRenderer
+import com.writhlang.scenario.SensitivityConfig
+import com.writhlang.time.ThetaPeriod
 import zio._
 
 import java.nio.charset.StandardCharsets
@@ -51,7 +53,12 @@ object Main extends ZIOAppDefault {
       } yield (market, program)) match {
         case Left(err) => ZIO.succeed(println(s"Error: $err"))
         case Right((market, program)) =>
-          val dag = DslCompiler.build(program, market)
+          val thetaConfig: SensitivityConfig =
+            config.thetaDays match {
+              case Some(days) => SensitivityConfig(thetaPeriod = Some(ThetaPeriod(days)))
+              case None       => SensitivityConfig()
+            }
+          val dag = DslCompiler.build(program, market, thetaConfig)
           val dot = DotRenderer.toDot(dag)
           val dotPath = config.dotPath.getOrElse(Paths.get("build", "writhlang_dag.dot"))
           val pngPath = config.pngPath.getOrElse(Paths.get("build", "writhlang_dag.png"))
@@ -86,7 +93,9 @@ object Main extends ZIOAppDefault {
     println("--- Scenario Prices ---")
     DslCompiler.flattenInstruments(program.nodes).foreach { case (inst, _) =>
       val basePrice = results.getOrElse(DslCompiler.basePriceId(inst.id), Double.NaN)
-      println(s"${inst.id} base=${format(basePrice)}")
+      val theta = results.getOrElse(DslCompiler.thetaId(inst.id), Double.NaN)
+      val carry = results.getOrElse(DslCompiler.carryId(inst.id), Double.NaN)
+      println(s"${inst.id} base=${format(basePrice)} theta=${format(theta)} carry=${format(carry)}")
       program.shocks.foreach { shock =>
         val full = results.getOrElse(DslCompiler.fullScenarioId(inst.id, shock.name), Double.NaN)
         val lin = results.getOrElse(DslCompiler.linearScenarioId(inst.id, shock.name), Double.NaN)
@@ -108,7 +117,8 @@ object Main extends ZIOAppDefault {
     inputPath: Option[java.nio.file.Path],
     marketPath: Option[java.nio.file.Path],
     dotPath: Option[java.nio.file.Path],
-    pngPath: Option[java.nio.file.Path]
+    pngPath: Option[java.nio.file.Path],
+    thetaDays: Option[Int]
   )
 
   private object CliConfig {
@@ -118,6 +128,7 @@ object Main extends ZIOAppDefault {
       var market: Option[java.nio.file.Path] = None
       var dot: Option[java.nio.file.Path] = None
       var png: Option[java.nio.file.Path] = None
+      var thetaDays: Option[Int] = None
 
       while (iter.hasNext) {
         iter.next() match {
@@ -125,11 +136,12 @@ object Main extends ZIOAppDefault {
           case "--market" if iter.hasNext => market = Some(Paths.get(iter.next()))
           case "--dot" if iter.hasNext    => dot = Some(Paths.get(iter.next()))
           case "--png" if iter.hasNext    => png = Some(Paths.get(iter.next()))
+          case "--theta-days" if iter.hasNext => thetaDays = Some(iter.next().toInt)
           case path if input.isEmpty      => input = Some(Paths.get(path))
           case _                          => ()
         }
       }
-      CliConfig(input, market, dot, png)
+      CliConfig(input, market, dot, png, thetaDays)
     }
   }
 }

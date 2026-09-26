@@ -205,7 +205,7 @@ capfloorvol EUR.CAP relative +0.01
 
 ## 7. Market data (JSON)
 
-Market data is a separate JSON document. A curve is either bootstrapped from quoted instruments or flat (a credit spread).
+Market data is a separate JSON document. A curve is either bootstrapped from quoted instruments or flat (a credit spread). The optional top-level `"asOf"` key (an ISO date, `"YYYY-MM-DD"`) sets the valuation date; it defaults to `2024-01-01` when omitted. `asOf` is what Stage 3 uses to compute theta (time decay) and carry.
 
 ```json
 {

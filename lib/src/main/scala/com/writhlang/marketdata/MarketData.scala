@@ -3,6 +3,8 @@ package com.writhlang.marketdata
 import com.writhlang.marketdata.bootstrap.QuoteSet
 import com.writhlang.risk.RiskFactorKey
 
+import java.time.LocalDate
+
 /**
   * A market-data snapshot: the set of market objects a pricing function needs,
   * each addressed by a [[RiskFactorKey]]. The key's `KeyType` determines which
@@ -17,6 +19,7 @@ import com.writhlang.risk.RiskFactorKey
   * and updated via the `with*` copy methods.
   */
 final case class MarketData(
+  asOf: LocalDate = LocalDate.of(2024, 1, 1),
   curves: Map[RiskFactorKey, Curve] = Map.empty,
   curveQuotes: Map[RiskFactorKey, QuoteSet] = Map.empty,
   volSurfaces: Map[RiskFactorKey, VolSurface] = Map.empty,
@@ -24,6 +27,9 @@ final case class MarketData(
   fxSpots: Map[RiskFactorKey, SpotQuote] = Map.empty,
   correlations: Map[RiskFactorKey, CorrelationMatrix] = Map.empty
 ) {
+  /** The same snapshot valued one valuation date later (or earlier). */
+  def withAsOf(date: LocalDate): MarketData = copy(asOf = date)
+
   def curve(key: RiskFactorKey): Curve = curves(key)
   def quotes(key: RiskFactorKey): QuoteSet = curveQuotes(key)
   def volSurface(key: RiskFactorKey): VolSurface = volSurfaces(key)

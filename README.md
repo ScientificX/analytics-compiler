@@ -50,6 +50,7 @@ WrithLang lets you describe market **shocks** (scenarios) and a portfolio of fin
 - **7 instrument types**: bond, mortgage, MBS pool, swap, cap, swaption, FX forward.
 - **Shocks** as scalar factor moves (`rate`, `spread`, `prepay`, `volatility`, `fx`) and curve shifts (`parallel`, `bucket`, `twist`).
 - **Greeks** computed by finite differences: delta, gamma, and cross-gamma.
+- **Theta & carry** (time dimension): one-day time decay and accrued coupon, driven by the dated `asOf` snapshot.
 - **Scenario pricing**: exact full re-price, plus linear and quadratic (Taylor) approximations.
 - **DAG execution** with topological ordering and parallel evaluation per level.
 - **Graphviz DOT** visualization, clustered by instrument.
@@ -136,6 +137,7 @@ The CLI accepts the following arguments (from `com.writhlang.app.Main`):
 | `--input <path>`  | DSL source file to read (UTF-8). A bare positional path also works. | built-in example DSL        |
 | `--dot <path>`    | Where to write the Graphviz DOT graph.                         | `build/writhlang_dag.dot`   |
 | `--png <path>`    | Where to write the rendered PNG (requires Graphviz `dot`).     | `build/writhlang_dag.png`   |
+| `--theta-days <n>`| Business-day horizon for theta/carry (default `1`).             | `1`                          |
 
 Example:
 
@@ -204,6 +206,8 @@ The full grammar and validation rules are documented in [docs/dsl-reference.md](
 When run successfully, WrithLang prints `--- Scenario Prices ---` followed by, for each instrument:
 
 - `base` — the unshocked present value.
+- `theta` — one-day time decay (the instrument aged on the frozen market).
+- `carry` — the accrued coupon over the period (bonds only in Stage 3).
 - per shock:
   - `full` — exact re-priced value under the full shock.
   - `linear` — first-order Taylor approximation (base + Σ delta·shock).
@@ -213,7 +217,7 @@ Example:
 
 ```text
 --- Scenario Prices ---
-BondA base=1001234.5678
+BondA base=1001234.5678 theta=150.4210 carry=136.9863
   up: full=999123.4567 linear=999100.1234 quadratic=999122.9876
   down: full=1003345.6789 linear=1003400.0000 quadratic=1003346.1234
 ```

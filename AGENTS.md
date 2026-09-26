@@ -53,6 +53,7 @@ Run from the repository root. On Windows use `gradlew.bat` instead of `./gradlew
 | `risk`   | Risk-factor taxonomy, canonical keys, shift types (`KeyType`, `RiskFactorKey`, `ShiftType`). |
 | `marketdata` | Market-data objects (`Curve`, `MarketData`, `VolSurface`, `PrepayVector`, `SpotQuote`), curve bootstrapping (`bootstrap`), JSON loader (`MarketDataJson`). |
 | `scenario` | Shock shapes, scenarios, sensitivity config (`Scenario`, `ShiftShape`, `ScenarioGenerator`, `SensitivityConfig`, `par`). |
+| `time` | Day-count and business-day conventions for the time dimension (`DayCount`, `Calendar`, `BusinessDayConvention`, `ThetaPeriod`). |
 | `render` | `DotRenderer` — Graphviz DOT output. |
 | `compiler` | Early-stage native x86-64 GAS backend (`Compiler`, `frontend`, `ast`, `ir`, `backend.gas`). |
 | `interpreter` | Thin wrapper around `Compiler` (pure `Either` + ZIO `IO`). |
@@ -165,6 +166,10 @@ Canonical terms used across `dsl/`, `engine/`, and `docs/dsl-reference.md`. Refe
 | Linear Taylor | `base + Σ delta_i·shock_i` (first-order approximation). |
 | Quadratic Taylor | linear + `½ Σ gamma_i·shock_i² + ΣΣ cross_ij·shock_i·shock_j`. |
 | DAG | Directed acyclic graph of `Instruction` nodes, giving computation traceability. |
+| Theta | Value change from time passing with the market frozen — the instrument ages on the frozen curve, so it **includes rolldown**. |
+| Carry | Cash accrual earned over a holding period (coupon/interest − financing; financing is deferred). |
+| Rolldown | Price change from the curve's slope as an instrument's maturity shortens. |
+| Time decay (pull-to-par) | Price change from being one period closer to each cashflow at an unchanged rate. |
 
 ## Testing conventions
 

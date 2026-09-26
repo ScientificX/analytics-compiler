@@ -54,6 +54,8 @@ There are **two independent compiler systems**:
 | `scenario` | `ShiftShape.scala`, `Scenario.scala`, `ScenarioGenerator.scala` | Shock shapes and scenario transformations. |
 | | `ShiftScheme.scala` | `ShiftScheme` + `SensitivityConfig`. |
 | | `par/CurveShiftParData.scala` | Pillar → par-instrument mapping. |
+| | `time` | `DayCount.scala`, `Calendar.scala` | Day-count conventions, business-day calendar, and the theta horizon (`ThetaPeriod`). |
+
 | `render` | `DotRenderer.scala` | Graphviz DOT emission. |
 | `compiler` | `Compiler.scala` + subpackages | Native x86-64 GAS backend (stub). |
 | `interpreter` | `Interpreter.scala` | Thin wrapper around `Compiler`. |
@@ -79,7 +81,9 @@ Instrument specs carry trade terms (notional, coupon, strike, maturity, …) and
 | Op | Meaning |
 | --- | --- |
 | `Const(v)` | literal shock value (leaf) |
-| `Price(instrument, market)` | re-price under a market snapshot (leaf) |
+| `Price(instrument, market, elapsedYears)` | re-price under a market snapshot at an elapsed time offset (leaf) |
+| `Theta(baseId, thetaEvalId)` | theta (time decay): aged revaluation minus base |
+| `Carry(instrument, market, elapsedYears)` | cash carry (accrued coupon; leaf) |
 | `DeltaCentral` / `DeltaForward` / `DeltaBackward` | first-order sensitivity (central `(up−down)/2h`, forward `(up−base)/h`, backward `(base−down)/h`) |
 | `Gamma` | second-order `(up−2·base+down)/h²` (always central) |
 | `CrossGamma` | mixed second-order |
@@ -98,6 +102,8 @@ Deterministic ids encode type, instrument, and factor canonical key:
 | `greek:delta:<inst>:<key>` / `greek:gamma:<inst>:<key>` | Greeks |
 | `greek:cross:<inst>:<k1>:<k2>` | cross-gamma |
 | `price:linear:<inst>:<shock>` / `price:quad:<inst>:<shock>` / `price:full:<inst>:<shock>` | scenario prices |
+| `price:thetaeval:<inst>` | aged revaluation (leaf) |
+| `price:theta:<inst>` / `price:carry:<inst>` | theta (time decay) / cash carry |
 
 ### 5.3 DAG construction
 
@@ -111,13 +117,15 @@ Deterministic ids encode type, instrument, and factor canonical key:
 
 ## 6. Market data & bootstrap
 
-`MarketData` holds keyed market objects: `curves` (bootstrapped `Curve`), `curveQuotes` (the `QuoteSet` inputs), `volSurfaces`, `prepayVectors`, `fxSpots`, `correlations`. `MarketDataJson.parse` builds it from JSON.
+`MarketData` holds keyed market objects: `curves` (bootstrapped `Curve`), `curveQuotes` (the `QuoteSet` inputs), `volSurfaces`, `prepayVectors`, `fxSpots`, `correlations`, and a valuation date `asOf: LocalDate`. `MarketDataJson.parse` builds it from JSON (an optional `"asOf"` key sets the date).
 
 `Bootstrapper.bootstrap(quotes)` builds a `BootstrappedCurve` sequentially (deposits → futures → swaps), pinning one discount factor per instrument, with log-linear discount-factor interpolation between pillars (`DiscountCurveInterpolator`).
 
 ## 7. Pricing model notes
 
 All prices are closed-form present values. Each instrument consumes market-data objects resolved from its key references; a shock transforms the market snapshot (quotes → re-bootstrap), never a scalar inside `Pricing`.
+
+Stage 3 adds the **time dimension**: `Pricing.price(instrument, market, elapsedYears)` shortens every time-to-cashflow tenor by `elapsedYears` (the "instrument rolls down" theta mechanism), and `Pricing.carry(...)` returns the accrued coupon (bond) over the period. The `SensitivityConfig.thetaPeriod` (a business-day `ThetaPeriod`) sets the horizon.
 
 | Instrument | Model |
 | --- | --- |

@@ -122,6 +122,7 @@ final case class BootstrappedCurve(pillars: Vector[(Double, Double)]) extends Cu
 
 ```scala
 final case class MarketData(
+  asOf: LocalDate = LocalDate.of(2024, 1, 1),
   curves: Map[RiskFactorKey, Curve] = Map.empty,
   curveQuotes: Map[RiskFactorKey, QuoteSet] = Map.empty,
   volSurfaces: Map[RiskFactorKey, VolSurface] = Map.empty,
@@ -182,6 +183,19 @@ object MarketDataJson { def parse(json: String): Either[String, MarketData] }
 
 Loads the JSON schema documented in [dsl-reference.md](dsl-reference.md). A curve entry is either `{ "type": ..., "instruments": [...] }` (bootstrapped) or `{ "type": ..., "flat": rate }` (flat).
 
+### 5.6 `com.writhlang.time` — day-count & business-day conventions
+
+```scala
+sealed trait DayCount { def yearFraction(from: LocalDate, to: LocalDate): Double } // Actual365Fixed, Actual360, Thirty360
+trait Calendar { def isBusinessDay(date: LocalDate): Boolean; def addBusinessDays(date: LocalDate, days: Int): LocalDate }
+object Calendar { val weekend: Calendar }
+sealed trait BusinessDayConvention { def adjust(date: LocalDate, calendar: Calendar): LocalDate } // Following, ModifiedFollowing, Preceding, Unadjusted
+final case class ThetaPeriod(days: Int) { def elapsedYears(asOf: LocalDate, calendar: Calendar, dayCount: DayCount): Double }
+```
+
+`ThetaPeriod` is the theta horizon (ORE's `thetaPeriod_`): a business-day count converted to an `elapsedYears` year fraction, which pricing subtracts from every time-to-cashflow tenor.
+
+
 ## 6. `com.writhlang.scenario` — shocks & sensitivities
 
 ### 6.1 `ShiftShape`
@@ -213,10 +227,13 @@ final case class Scenario(name: String, shifts: List[(RiskFactorKey, ScenarioShi
 ```scala
 sealed trait ShiftScheme { def name: String }   // Forward | Backward | Central
 final case class SensitivityConfig(shiftScheme: ShiftScheme = ShiftScheme.Central,
-                                   bumpFor: RiskFactorKey => Double = SensitivityConfig.defaultBump)
+                                   bumpFor: RiskFactorKey => Double = SensitivityConfig.defaultBump,
+                                   thetaPeriod: Option[ThetaPeriod] = Some(ThetaPeriod(days = 1)),
+                                   dayCount: DayCount = DayCount.Actual365Fixed,
+                                   calendar: Calendar = Calendar.weekend)
 ```
 
-`defaultBump` is `1e-4` for rates/spreads (1bp), `1e-2` for prepay, `1e-3` for vol/fx.
+`defaultBump` is `1e-4` for rates/spreads (1bp), `1e-2` for prepay, `1e-3` for vol/fx. `thetaPeriod` is the Stage 3 theta horizon; `None` disables theta/carry emission.
 
 ### 6.4 `ScenarioGenerator`
 
@@ -240,7 +257,9 @@ Maps a pillar to the par instrument whose quote is bumped (par-conversion).
 
 ```scala
 sealed trait Op
-case class Price(instrument: InstrumentSpec, market: MarketData) extends Op
+case class Price(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double = 0.0) extends Op
+case class Theta(baseId: String, thetaEvalId: String) extends Op
+case class Carry(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double) extends Op
 case class Const(value: Double) extends Op
 case class DeltaCentral(baseId, upId, downId, bump) extends Op
 case class DeltaForward(baseId, upId, bump) extends Op
@@ -287,14 +306,15 @@ object Executor {
 
 ```scala
 object Pricing {
-  def price(instrument: InstrumentSpec, market: MarketData): Double
-  def bondPrice(spec: BondSpec, curve: Curve): Double
-  def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector): Double
-  def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector): Double
-  def swapPrice(spec: SwapSpec, curve: Curve): Double
-  def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface): Double
-  def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface): Double
-  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote): Double
+  def price(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double = 0.0): Double
+  def carry(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double): Double
+  def bondPrice(spec: BondSpec, curve: Curve, elapsedYears: Double = 0.0): Double
+  def mortgagePrice(spec: MortgageSpec, curve: Curve, prepay: PrepayVector, elapsedYears: Double = 0.0): Double
+  def mbsPrice(spec: MbsPoolSpec, curve: Curve, prepay: PrepayVector, elapsedYears: Double = 0.0): Double
+  def swapPrice(spec: SwapSpec, curve: Curve, elapsedYears: Double = 0.0): Double
+  def capPrice(spec: CapSpec, curve: Curve, volSurface: VolSurface, elapsedYears: Double = 0.0): Double
+  def swaptionPrice(spec: SwaptionSpec, curve: Curve, volSurface: VolSurface, elapsedYears: Double = 0.0): Double
+  def fxForwardPrice(spec: FxForwardSpec, domestic: Curve, foreign: Curve, fx: SpotQuote, elapsedYears: Double = 0.0): Double
 }
 ```
 
@@ -317,7 +337,7 @@ object Main extends ZIOAppDefault {
 }
 ```
 
-Flow: read args (`--input`, `--market`, `--dot`, `--png`) → load DSL + market JSON → `MarketDataJson.parse` + `Parser.parseProgram` → `DslCompiler.build` → `DotRenderer.toDot` → write DOT/PNG → `Executor.run` → print per-instrument base price and per-shock `full`/`linear`/`quadratic`.
+Flow: read args (`--input`, `--market`, `--dot`, `--png`, `--theta-days`) → load DSL + market JSON → `MarketDataJson.parse` + `Parser.parseProgram` → `DslCompiler.build` → `DotRenderer.toDot` → write DOT/PNG → `Executor.run` → print per-instrument base price, `theta`, `carry`, and per-shock `full`/`linear`/`quadratic`.
 
 ## 10. Node-id reference
 
@@ -330,6 +350,8 @@ Flow: read args (`--input`, `--market`, `--dot`, `--png`) → load DSL + market 
 | `greek:delta:<inst>:<key>` / `greek:gamma:<inst>:<key>` | delta / gamma |
 | `greek:cross:<inst>:<k1>:<k2>` | cross-gamma |
 | `price:linear:<inst>:<shock>` / `price:quad:<inst>:<shock>` / `price:full:<inst>:<shock>` | scenario prices |
+| `price:thetaeval:<inst>` | aged revaluation (leaf) |
+| `price:theta:<inst>` / `price:carry:<inst>` | theta (time decay) / cash carry |
 
 The canonical key may itself contain `:` (e.g. `DiscountCurve:EUR:2Y`), so ids are parsed positionally where needed.
 

@@ -5,8 +5,17 @@ import com.writhlang.marketdata.MarketData
 
 sealed trait Op
 
-/** Price an instrument under a market-data snapshot (leaf). */
-case class Price(instrument: InstrumentSpec, market: MarketData) extends Op
+/**
+  * Price an instrument under a market-data snapshot (leaf). `elapsedYears` is the
+  * time already passed; it shortens every time-to-cashflow tenor (theta aging).
+  */
+case class Price(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double = 0.0) extends Op
+
+/** Theta (time decay): the aged revaluation minus the base price. */
+case class Theta(baseId: String, thetaEvalId: String) extends Op
+
+/** Cash carry over the holding period (accrued coupon; leaf). */
+case class Carry(instrument: InstrumentSpec, market: MarketData, elapsedYears: Double) extends Op
 
 /** Literal shock value (leaf). */
 case class Const(value: Double) extends Op
